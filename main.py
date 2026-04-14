@@ -75,6 +75,8 @@ class PolymarketBot:
         self.tuning_interval = 300  # run tuner every 5 minutes
         self.last_status_time = 0
         self.status_interval = 30  # print status every 30 seconds
+        self.last_settlement_check = 0
+        self.settlement_interval = config.SETTLEMENT_CHECK_INTERVAL_SEC
         self.last_day = None
 
         # Load model if exists
@@ -175,6 +177,11 @@ class PolymarketBot:
                     order.fill_price,
                     round(fill["realized_pnl"] + fill["rebate"], 4),
                 )
+
+        # ── Settle resolved markets ──
+        if now - self.last_settlement_check > self.settlement_interval:
+            self.last_settlement_check = now
+            await self._settle_resolved_markets()
 
         # ── Generate paper orders ──
         orders = []
@@ -289,6 +296,43 @@ class PolymarketBot:
             })
         except Exception as e:
             log.error(f"Failed to save daily PnL: {e}")
+
+    async def _settle_resolved_markets(self):
+        """Resolve markets once Polymarket exposes a decisive outcome."""
+        market_ids = list(self.risk.positions.keys())
+        for market_id in market_ids:
+            if database.is_market_settled(self.db, market_id):
+                continue
+
+            market = await self.polymarket.fetch_market_metadata(market_id)
+            settlement = self.polymarket.get_settlement_info(market)
+            if not settlement:
+                continue
+
+            result = self.risk.settle_market(
+                market_id,
+                settlement["payout_yes"],
+                settlement["payout_no"],
+            )
+            if not result:
+                continue
+
+            self.trader.cancel_all(market_id=market_id)
+            database.record_market_settlement(self.db, {
+                "market_id": market_id,
+                "settled_at": time.time(),
+                "winning_side": settlement["winning_side"],
+                "payout_yes": settlement["payout_yes"],
+                "payout_no": settlement["payout_no"],
+                "num_yes_shares": result["num_yes_shares"],
+                "num_no_shares": result["num_no_shares"],
+                "realized_pnl": result["realized_pnl"],
+                "source": settlement["source"],
+            })
+            log.info(
+                f"  SETTLED: {market_id[:8]} winner={settlement['winning_side']} "
+                f"pnl=${result['realized_pnl']:+.2f}"
+            )
 
     async def shutdown(self):
         """Clean shutdown."""
