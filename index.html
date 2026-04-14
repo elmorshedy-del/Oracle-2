@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Bot — Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  :root {
+    --bg: #0a0e17;
+    --bg2: #111827;
+    --bg3: #1a2235;
+    --border: #1e2d45;
+    --text: #c9d1d9;
+    --text-dim: #6b7b8d;
+    --text-bright: #e6edf3;
+    --green: #00e676;
+    --green-dim: #00e67633;
+    --red: #ff5252;
+    --red-dim: #ff525233;
+    --amber: #ffc107;
+    --amber-dim: #ffc10733;
+    --blue: #42a5f5;
+    --blue-dim: #42a5f533;
+    --purple: #b388ff;
+    --cyan: #00e5ff;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    overflow-x: hidden;
+  }
+
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  /* ── Top Bar ── */
+  .topbar {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .topbar-left { display: flex; align-items: center; gap: 24px; }
+  .topbar-right { display: flex; align-items: center; gap: 20px; }
+  .logo {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 16px;
+    color: var(--green);
+    letter-spacing: -0.5px;
+  }
+  .logo span { color: var(--text-dim); font-weight: 400; }
+  .btc-price {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text-bright);
+  }
+  .conn-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block; margin-right: 6px;
+  }
+  .conn-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .conn-dot.off { background: var(--red); }
+  .conn-label { font-size: 12px; color: var(--text-dim); margin-right: 16px; }
+  .paper-badge {
+    background: var(--amber-dim);
+    color: var(--amber);
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  /* ── Grid Layout ── */
+  .grid {
+    display: grid;
+    grid-template-columns: 320px 1fr 300px;
+    grid-template-rows: auto auto;
+    gap: 1px;
+    background: var(--border);
+    min-height: calc(100vh - 52px);
+  }
+
+  .panel {
+    background: var(--bg);
+    padding: 20px;
+  }
+  .panel-title {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ── Mode Display ── */
+  .mode-display {
+    text-align: center;
+    padding: 24px 0;
+  }
+  .mode-number {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 72px;
+    font-weight: 700;
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+  .mode-label {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .mode-reason {
+    font-size: 12px;
+    color: var(--text-dim);
+    padding: 8px 12px;
+    background: var(--bg2);
+    border-radius: 6px;
+    margin-top: 12px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .mode1 .mode-number { color: var(--text-dim); }
+  .mode2 .mode-number { color: var(--blue); }
+  .mode3 .mode-number { color: var(--amber); }
+  .mode4 .mode-number { color: var(--green); }
+
+  /* ── Signal Bars ── */
+  .signal-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .signal-label { font-size: 12px; color: var(--text-dim); }
+  .signal-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .signal-bar {
+    width: 100%;
+    height: 4px;
+    background: var(--bg3);
+    border-radius: 2px;
+    margin-top: 4px;
+    overflow: hidden;
+  }
+  .signal-bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.5s ease;
+  }
+
+  /* ── Lean Arrow ── */
+  .lean-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin: 16px 0;
+    padding: 12px;
+    background: var(--bg2);
+    border-radius: 8px;
+  }
+  .lean-arrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 24px;
+    font-weight: 700;
+  }
+  .lean-conf {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    color: var(--text-dim);
+  }
+
+  /* ── Charts ── */
+  .chart-container {
+    position: relative;
+    height: 200px;
+    margin-bottom: 20px;
+  }
+
+  /* ── Stats Cards ── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .stat-card {
+    background: var(--bg2);
+    border-radius: 8px;
+    padding: 14px;
+    border: 1px solid var(--border);
+  }
+  .stat-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+  }
+  .stat-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text-bright);
+  }
+  .stat-value.positive { color: var(--green); }
+  .stat-value.negative { color: var(--red); }
+
+  /* ── Training Progress ── */
+  .progress-bar {
+    width: 100%;
+    height: 12px;
+    background: var(--bg3);
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 8px 0;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--blue), var(--cyan));
+    transition: width 1s ease;
+  }
+  .progress-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .training-run {
+    background: var(--bg2);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    border-left: 3px solid var(--border);
+  }
+  .training-run.deployed { border-left-color: var(--green); }
+  .training-run-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+  }
+  .training-run-acc {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  /* ── Trades Table ── */
+  .trades-panel {
+    grid-column: 1 / -1;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  th {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+  }
+  td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+  }
+  tr:hover { background: var(--bg2); }
+  .fill-yes { color: var(--green); }
+  .fill-no { color: var(--text-dim); }
+  .side-yes { color: var(--green); }
+  .side-no { color: var(--red); }
+  .mode-badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .mode-badge.m1 { background: var(--bg3); color: var(--text-dim); }
+  .mode-badge.m2 { background: var(--blue-dim); color: var(--blue); }
+  .mode-badge.m3 { background: var(--amber-dim); color: var(--amber); }
+  .mode-badge.m4 { background: var(--green-dim); color: var(--green); }
+
+  /* ── Mode Distribution ── */
+  .mode-dist {
+    display: flex;
+    gap: 4px;
+    height: 24px;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 12px 0;
+  }
+  .mode-dist-seg {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+    transition: flex 0.5s ease;
+  }
+  .mode-dist-seg.m1 { background: var(--bg3); color: var(--text-dim); }
+  .mode-dist-seg.m2 { background: var(--blue-dim); color: var(--blue); }
+  .mode-dist-seg.m3 { background: var(--amber-dim); color: var(--amber); }
+  .mode-dist-seg.m4 { background: var(--green-dim); color: var(--green); }
+
+  /* ── Explain Boxes ── */
+  .explain {
+    background: var(--bg2);
+    border-radius: 6px;
+    padding: 12px;
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+  .explain strong { color: var(--text); }
+
+  /* ── Responsive ── */
+  @media (max-width: 1100px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    .trades-panel { grid-column: 1 / -1; }
+  }
+  @media (max-width: 700px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══ TOP BAR ═══ -->
+<div class="topbar">
+  <div class="topbar-left">
+    <div class="logo">POLYBOT <span>v1.0</span></div>
+    <div class="btc-price" id="btc-price">$—</div>
+    <div id="btc-momentum" class="mono" style="font-size:13px; color:var(--text-dim)">—</div>
+  </div>
+  <div class="topbar-right">
+    <span>
+      <span class="conn-dot off" id="conn-binance"></span>
+      <span class="conn-label">Binance</span>
+    </span>
+    <span>
+      <span class="conn-dot off" id="conn-poly"></span>
+      <span class="conn-label">Polymarket</span>
+    </span>
+    <span>
+      <span class="conn-dot off" id="conn-kalshi"></span>
+      <span class="conn-label">Kalshi</span>
+    </span>
+    <span>
+      <span class="conn-dot off" id="conn-llm"></span>
+      <span class="conn-label">LLM</span>
+    </span>
+    <span class="paper-badge">PAPER MODE</span>
+    <span class="mono" style="font-size:11px; color:var(--text-dim)" id="uptime">00:00:00</span>
+  </div>
+</div>
+
+<!-- ═══ GRID ═══ -->
+<div class="grid">
+
+  <!-- LEFT: Mode + Signals -->
+  <div class="panel">
+    <div class="panel-title">Current Regime</div>
+    <div class="mode-display mode1" id="mode-display">
+      <div class="mode-number" id="mode-number">1</div>
+      <div class="mode-label" id="mode-label">QUIET</div>
+    </div>
+    <div class="mode-reason mono" id="mode-reason">Symmetric quotes — earning spread</div>
+
+    <div class="lean-indicator">
+      <span class="lean-arrow" id="lean-arrow" style="color:var(--text-dim)">─</span>
+      <span>
+        <div style="font-size:12px; color:var(--text-dim)">Lean</div>
+        <div class="lean-conf mono" id="lean-conf">0.00</div>
+      </span>
+    </div>
+
+    <div class="panel-title" style="margin-top:20px">Signals</div>
+    <div id="signals-container">
+      <div class="signal-row"><span class="signal-label">Momentum</span><span class="signal-value mono" id="sig-momentum">0.000%</span></div>
+      <div class="signal-row"><span class="signal-label">OB Imbalance</span><span class="signal-value mono" id="sig-imbalance">0.00</span></div>
+      <div class="signal-row"><span class="signal-label">Spread</span><span class="signal-value mono" id="sig-spread">—</span></div>
+      <div class="signal-row"><span class="signal-label">News Edge</span><span class="signal-value mono" id="sig-news-edge">—</span></div>
+      <div class="signal-row"><span class="signal-label">LLM Calls</span><span class="signal-value mono" id="sig-llm-calls">0</span></div>
+    </div>
+
+    <div class="panel-title" style="margin-top:20px">Mode Distribution</div>
+    <div class="mode-dist" id="mode-dist"></div>
+    <div id="mode-dist-labels" style="display:flex; gap:12px; font-size:11px; color:var(--text-dim)"></div>
+  </div>
+
+  <!-- CENTER: Charts + Stats -->
+  <div class="panel">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Balance</div>
+        <div class="stat-value" id="stat-balance">$5,000</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total P&L</div>
+        <div class="stat-value" id="stat-pnl">$0.00</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Today P&L</div>
+        <div class="stat-value" id="stat-daily-pnl">$0.00</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Fill Rate</div>
+        <div class="stat-value" id="stat-fill-rate">0%</div>
+      </div>
+    </div>
+
+    <div class="panel-title">BTC Price</div>
+    <div class="chart-container"><canvas id="chart-btc"></canvas></div>
+
+    <div class="panel-title">Mode Timeline</div>
+    <div class="chart-container"><canvas id="chart-mode"></canvas></div>
+
+    <div class="explain">
+      <strong>How it works:</strong> The bot runs 4 modes simultaneously.
+      <strong>Mode 1 (Quiet)</strong> places symmetric buy/sell orders on both sides, earning the spread + maker rebates.
+      <strong>Mode 2 (Lean)</strong> activates when Binance shows BTC moving — quotes shift to favor the predicted direction.
+      <strong>Mode 3 (Event)</strong> fires on breaking news (LLM-assessed) or extreme BTC moves — aggressive one-sided orders.
+      <strong>Mode 4 (Arb)</strong> triggers when Kalshi and Polymarket price the same event differently — locks in cross-platform profit.
+      Mode 1 is always running; the others modify its behavior.
+    </div>
+  </div>
+
+  <!-- RIGHT: Training + Status -->
+  <div class="panel">
+    <div class="panel-title">CatBoost Training</div>
+    <div id="training-section">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px">
+        <span style="font-size:12px; color:var(--text-dim)">Classifier</span>
+        <span class="mono" style="font-size:13px; font-weight:600" id="classifier-source">RULES</span>
+      </div>
+      <div class="progress-label">
+        <span id="train-samples">0 samples</span>
+        <span id="train-target">/ 5,000 needed</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="train-progress" style="width:0%"></div></div>
+      <div class="progress-label">
+        <span id="train-pct">0%</span>
+        <span id="train-eta"></span>
+      </div>
+    </div>
+
+    <div class="explain" style="margin-top:12px">
+      <strong>Auto-tuning:</strong> Every tick is logged with all signal values.
+      After 60 seconds, the system records what BTC actually did, creating labeled training data.
+      At 5,000 samples, CatBoost trains automatically.
+      If it beats 55% directional accuracy, it replaces the deterministic rules.
+    </div>
+
+    <div class="panel-title" style="margin-top:20px">Training Runs</div>
+    <div id="training-runs">
+      <div style="font-size:12px; color:var(--text-dim)">No training runs yet — collecting data...</div>
+    </div>
+
+    <div class="panel-title" style="margin-top:20px">System</div>
+    <div class="signal-row"><span class="signal-label">Ticks</span><span class="signal-value mono" id="sys-ticks">0</span></div>
+    <div class="signal-row"><span class="signal-label">Open Orders</span><span class="signal-value mono" id="sys-orders">0</span></div>
+    <div class="signal-row"><span class="signal-label">Total Fills</span><span class="signal-value mono" id="sys-fills">0</span></div>
+    <div class="signal-row"><span class="signal-label">Positions</span><span class="signal-value mono" id="sys-positions">0</span></div>
+    <div class="signal-row"><span class="signal-label">Halted</span><span class="signal-value mono" id="sys-halted" style="color:var(--green)">NO</span></div>
+  </div>
+
+  <!-- BOTTOM: Trades Table -->
+  <div class="panel trades-panel">
+    <div class="panel-title">Recent Paper Trades</div>
+    <div style="max-height:300px; overflow-y:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Mode</th>
+            <th>Side</th>
+            <th>Type</th>
+            <th>Price</th>
+            <th>Size</th>
+            <th>Filled</th>
+            <th>Fill Price</th>
+            <th>Lean</th>
+          </tr>
+        </thead>
+        <tbody id="trades-body">
+          <tr><td colspan="9" style="text-align:center; color:var(--text-dim)">Waiting for trades...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ═══ Charts Setup ═══
+const chartDefaults = {
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: { duration: 300 },
+  plugins: { legend: { display: false } },
+  scales: {
+    x: { grid: { color: '#1e2d45' }, ticks: { color: '#6b7b8d', font: { size: 10, family: 'JetBrains Mono' } } },
+    y: { grid: { color: '#1e2d45' }, ticks: { color: '#6b7b8d', font: { size: 10, family: 'JetBrains Mono' } } },
+  },
+};
+
+const btcChart = new Chart(document.getElementById('chart-btc'), {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [{
+      data: [],
+      borderColor: '#42a5f5',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.3,
+      fill: { target: 'origin', above: 'rgba(66,165,245,0.05)' },
+    }],
+  },
+  options: { ...chartDefaults, scales: {
+    ...chartDefaults.scales,
+    y: { ...chartDefaults.scales.y, ticks: { ...chartDefaults.scales.y.ticks,
+      callback: v => '$' + v.toLocaleString() } },
+  }},
+});
+
+const modeColors = ['', '#6b7b8d', '#42a5f5', '#ffc107', '#00e676'];
+const modeChart = new Chart(document.getElementById('chart-mode'), {
+  type: 'bar',
+  data: {
+    labels: [],
+    datasets: [{
+      data: [],
+      backgroundColor: [],
+      borderWidth: 0,
+      barPercentage: 1.0,
+      categoryPercentage: 1.0,
+    }],
+  },
+  options: {
+    ...chartDefaults,
+    scales: {
+      ...chartDefaults.scales,
+      y: { ...chartDefaults.scales.y, min: 0.5, max: 4.5,
+        ticks: { ...chartDefaults.scales.y.ticks, stepSize: 1,
+          callback: v => ['','Quiet','Lean','Event','Arb'][v] || '' } },
+    },
+  },
+});
+
+
+// ═══ Data Fetching ═══
+const API = '';  // same origin
+
+async function fetchStatus() {
+  try {
+    const res = await fetch(API + '/api/status');
+    const d = await res.json();
+    if (d.error) return;
+
+    // BTC Price
+    const btc = d.signals.btc_price;
+    document.getElementById('btc-price').textContent = btc ? '$' + btc.toLocaleString(undefined, {maximumFractionDigits:0}) : '$—';
+    const mom = d.signals.btc_momentum || 0;
+    const momEl = document.getElementById('btc-momentum');
+    momEl.textContent = (mom >= 0 ? '+' : '') + (mom * 100).toFixed(3) + '%';
+    momEl.style.color = mom > 0 ? 'var(--green)' : mom < 0 ? 'var(--red)' : 'var(--text-dim)';
+
+    // Connections
+    document.getElementById('conn-binance').className = 'conn-dot ' + (d.connections.binance ? 'on' : 'off');
+    document.getElementById('conn-poly').className = 'conn-dot ' + (d.connections.polymarket > 0 ? 'on' : 'off');
+    document.getElementById('conn-kalshi').className = 'conn-dot ' + (d.connections.kalshi > 0 ? 'on' : 'off');
+    document.getElementById('conn-llm').className = 'conn-dot ' + (d.connections.news_llm ? 'on' : 'off');
+
+    // Uptime
+    const secs = Math.floor(d.uptime_seconds || 0);
+    const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60), s = secs%60;
+    document.getElementById('uptime').textContent =
+      String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+
+    // Mode
+    const mode = d.regime.mode;
+    const modeNames = {1:'QUIET', 2:'LEAN', 3:'EVENT', 4:'ARB'};
+    const modeDisplay = document.getElementById('mode-display');
+    modeDisplay.className = 'mode-display mode' + mode;
+    document.getElementById('mode-number').textContent = mode;
+    document.getElementById('mode-label').textContent = modeNames[mode] || '?';
+    document.getElementById('mode-reason').textContent = d.regime.reason || '';
+
+    // Lean
+    const lean = d.regime.lean_direction;
+    const conf = d.regime.lean_confidence;
+    const arrowEl = document.getElementById('lean-arrow');
+    if (lean > 0.1) { arrowEl.textContent = '▲'; arrowEl.style.color = 'var(--green)'; }
+    else if (lean < -0.1) { arrowEl.textContent = '▼'; arrowEl.style.color = 'var(--red)'; }
+    else { arrowEl.textContent = '─'; arrowEl.style.color = 'var(--text-dim)'; }
+    document.getElementById('lean-conf').textContent = conf.toFixed(2);
+
+    // Signals
+    document.getElementById('sig-momentum').textContent = (mom * 100).toFixed(3) + '%';
+    document.getElementById('sig-imbalance').textContent = (d.signals.poly_orderbook_imbalance || 0).toFixed(3);
+    document.getElementById('sig-spread').textContent = d.signals.poly_spread ? d.signals.poly_spread.toFixed(4) : '—';
+    document.getElementById('sig-news-edge').textContent = d.signals.news_edge ? (d.signals.news_edge * 100).toFixed(1) + '%' : '—';
+    document.getElementById('sig-llm-calls').textContent = d.signals.news_call_count || 0;
+
+    // Stats
+    document.getElementById('stat-balance').textContent = '$' + (d.risk.balance || 0).toLocaleString(undefined, {maximumFractionDigits:0});
+    const pnl = d.risk.total_pnl || 0;
+    const pnlEl = document.getElementById('stat-pnl');
+    pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
+    pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'positive' : 'negative');
+    const dpnl = d.risk.daily_pnl || 0;
+    const dpnlEl = document.getElementById('stat-daily-pnl');
+    dpnlEl.textContent = (dpnl >= 0 ? '+$' : '-$') + Math.abs(dpnl).toFixed(2);
+    dpnlEl.className = 'stat-value ' + (dpnl >= 0 ? 'positive' : 'negative');
+    document.getElementById('stat-fill-rate').textContent = ((d.trader.fill_rate || 0) * 100).toFixed(0) + '%';
+
+    // System
+    document.getElementById('sys-ticks').textContent = (d.tick_count || 0).toLocaleString();
+    document.getElementById('sys-orders').textContent = d.trader.open_orders || 0;
+    document.getElementById('sys-fills').textContent = d.trader.total_fills || 0;
+    document.getElementById('sys-positions').textContent = d.risk.num_positions || 0;
+    const haltedEl = document.getElementById('sys-halted');
+    haltedEl.textContent = d.risk.halted ? 'YES' : 'NO';
+    haltedEl.style.color = d.risk.halted ? 'var(--red)' : 'var(--green)';
+
+  } catch(e) { console.debug('Status fetch error:', e); }
+}
+
+async function fetchTicks() {
+  try {
+    const res = await fetch(API + '/api/ticks?limit=120');
+    const d = await res.json();
+    if (!d.ticks || !d.ticks.length) return;
+
+    // BTC chart
+    const labels = d.ticks.map(t => {
+      const dt = new Date(t.timestamp * 1000);
+      return dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    });
+    const prices = d.ticks.map(t => t.btc_price).filter(Boolean);
+    btcChart.data.labels = labels.slice(-prices.length);
+    btcChart.data.datasets[0].data = prices;
+    btcChart.update('none');
+
+    // Mode timeline
+    const modes = d.ticks.map(t => t.mode || 1);
+    const colors = modes.map(m => modeColors[m] || modeColors[1]);
+    modeChart.data.labels = labels;
+    modeChart.data.datasets[0].data = modes;
+    modeChart.data.datasets[0].backgroundColor = colors;
+    modeChart.update('none');
+
+  } catch(e) { console.debug('Ticks fetch error:', e); }
+}
+
+async function fetchTrades() {
+  try {
+    const res = await fetch(API + '/api/trades?limit=30');
+    const d = await res.json();
+    if (!d.trades || !d.trades.length) return;
+
+    const tbody = document.getElementById('trades-body');
+    tbody.innerHTML = d.trades.map(t => `
+      <tr>
+        <td>${t.timestamp_str}</td>
+        <td><span class="mode-badge m${t.mode}">${t.mode_label}</span></td>
+        <td class="side-${t.side.toLowerCase()}">${t.side}</td>
+        <td>${t.order_type}</td>
+        <td>$${t.price.toFixed(3)}</td>
+        <td>${t.size}</td>
+        <td class="${t.filled ? 'fill-yes' : 'fill-no'}">${t.filled ? '✓' : '—'}</td>
+        <td>${t.filled ? '$' + t.fill_price.toFixed(3) : '—'}</td>
+        <td style="color:${t.lean_direction > 0 ? 'var(--green)' : t.lean_direction < 0 ? 'var(--red)' : 'var(--text-dim)'}">${t.lean_direction > 0 ? '▲' : t.lean_direction < 0 ? '▼' : '─'} ${t.lean_confidence.toFixed(2)}</td>
+      </tr>
+    `).join('');
+
+  } catch(e) { console.debug('Trades fetch error:', e); }
+}
+
+async function fetchTraining() {
+  try {
+    const res = await fetch(API + '/api/training');
+    const d = await res.json();
+
+    const src = document.getElementById('classifier-source');
+    src.textContent = d.classifier_source === 'model' ? 'CATBOOST' : 'RULES';
+    src.style.color = d.classifier_source === 'model' ? 'var(--green)' : 'var(--amber)';
+
+    document.getElementById('train-samples').textContent = (d.labeled_ticks || 0).toLocaleString() + ' samples';
+    document.getElementById('train-target').textContent = '/ ' + (d.min_samples_needed || 5000).toLocaleString() + ' needed';
+    document.getElementById('train-progress').style.width = (d.progress_pct || 0) + '%';
+    document.getElementById('train-pct').textContent = (d.progress_pct || 0).toFixed(0) + '%';
+
+    // ETA
+    if (d.total_ticks > 10 && d.labeled_ticks < d.min_samples_needed) {
+      const remaining = d.min_samples_needed - d.labeled_ticks;
+      const etaMin = Math.ceil(remaining * 2 / 60);  // ~2 sec per tick
+      document.getElementById('train-eta').textContent = '~' + etaMin + ' min to train';
+    } else if (d.labeled_ticks >= d.min_samples_needed) {
+      document.getElementById('train-eta').textContent = 'Ready to train';
+    }
+
+    // Training runs
+    const runsEl = document.getElementById('training-runs');
+    if (d.training_runs && d.training_runs.length) {
+      runsEl.innerHTML = d.training_runs.map(r => `
+        <div class="training-run ${r.model_deployed ? 'deployed' : ''}">
+          <div class="training-run-header">
+            <span>${r.timestamp_str}</span>
+            <span>${r.model_deployed ? '🟢 DEPLOYED' : '⊘ Not deployed'}</span>
+          </div>
+          <div style="margin-top:4px">
+            <span class="training-run-acc" style="color:${r.test_accuracy >= 0.55 ? 'var(--green)' : 'var(--red)'}">
+              ${(r.test_accuracy * 100).toFixed(1)}% accuracy
+            </span>
+            <span style="font-size:11px; color:var(--text-dim); margin-left:8px">
+              on ${r.num_samples.toLocaleString()} samples
+            </span>
+          </div>
+        </div>
+      `).join('');
+    }
+
+  } catch(e) { console.debug('Training fetch error:', e); }
+}
+
+async function fetchModeDist() {
+  try {
+    const res = await fetch(API + '/api/mode_distribution');
+    const d = await res.json();
+    if (!d.modes || !d.modes.length) return;
+
+    const distEl = document.getElementById('mode-dist');
+    const labelsEl = document.getElementById('mode-dist-labels');
+
+    distEl.innerHTML = d.modes.map(m =>
+      `<div class="mode-dist-seg m${m.mode}" style="flex:${Math.max(m.pct, 2)}">${m.pct}%</div>`
+    ).join('');
+
+    labelsEl.innerHTML = d.modes.map(m =>
+      `<span class="mono">${m.label}</span>`
+    ).join('');
+
+  } catch(e) { console.debug('Mode dist fetch error:', e); }
+}
+
+
+// ═══ Polling Loop ═══
+async function poll() {
+  await Promise.all([fetchStatus(), fetchTicks(), fetchTrades(), fetchTraining(), fetchModeDist()]);
+}
+
+poll();
+setInterval(poll, 3000);  // refresh every 3 seconds
+</script>
+
+</body>
+</html>
