@@ -92,6 +92,9 @@ MAX_INVENTORY_PER_SIDE = 500  # max shares held on one side
 MAX_TOTAL_EXPOSURE = 1000.0  # max USD exposure across all positions
 DAILY_DRAWDOWN_LIMIT = 0.05  # 5% of capital = hard stop
 FILL_PROBABILITY = 0.3  # probability a paper limit order fills per cycle
+ORDER_TTL_SEC = 30  # how long resting paper quotes stay live before expiring
+PASSIVE_FILL_RATIO = 0.15  # odds of a resting maker order filling without a full cross
+PASSIVE_FILL_DISTANCE_BPS = 100  # resting quote can fill if within 1% of the reference price
 MAKER_REBATE_BPS = 10  # ~0.1% maker rebate (estimate)
 TAKER_FEE_MAX_BPS = 156  # 1.56% max taker fee at 50% probability
 ORDER_MAX_AGE_SEC = 30  # orders expire after this many seconds

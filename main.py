@@ -207,7 +207,7 @@ class PolymarketBot:
         # Log new orders
         for order in orders:
             try:
-                database.log_paper_trade(self.db, {
+                order.db_trade_id = database.log_paper_trade(self.db, {
                     "timestamp": order.timestamp,
                     "market_id": order.market_id,
                     "side": order.side,

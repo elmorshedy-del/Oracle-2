@@ -36,6 +36,7 @@ class PaperOrder:
     mode: int = 1
     lean_direction: float = 0.0
     lean_confidence: float = 0.0
+    db_trade_id: Optional[int] = None
 
 
 @dataclass
@@ -282,11 +283,12 @@ class RiskManager:
 
     def update_position(self, market_id: str, side: str, shares: float,
                         price: float, is_buy: bool):
-        """Update position after a fill."""
+        """Update position after a fill and return realized PnL for this action."""
         if market_id not in self.positions:
             self.positions[market_id] = Position(market_id=market_id)
 
         pos = self.positions[market_id]
+        realized_pnl = 0.0
 
         if is_buy:
             cost = shares * price
@@ -317,8 +319,15 @@ class RiskManager:
             pos.realized_pnl += pnl
             pos.total_cost = max(0, pos.total_cost - revenue)
             self.balance += revenue
+            realized_pnl = pnl
 
         # Track peak
+        self.peak_balance = max(self.peak_balance, self.balance)
+        return realized_pnl
+
+    def apply_rebate(self, rebate: float):
+        """Credit maker rebates directly to balance."""
+        self.balance += rebate
         self.peak_balance = max(self.peak_balance, self.balance)
 
     def reset_daily(self):
@@ -502,13 +511,22 @@ class PaperTrader:
 
         # Risk check each order
         approved = []
+        active_keys = {
+            (o.market_id, o.side, o.order_type)
+            for o in self.open_orders
+            if not o.filled
+        }
         for order in orders:
+            order_key = (order.market_id, order.side, order.order_type)
+            if order_key in active_keys:
+                continue
             allowed, adj_size, reason = self.risk.check_order(
                 order.market_id, order.side, order.size, order.price
             )
             if allowed and adj_size > 0:
                 order.size = adj_size
                 approved.append(order)
+                active_keys.add(order_key)
 
         self.open_orders.extend(approved)
         self.total_orders_placed += len(approved)
