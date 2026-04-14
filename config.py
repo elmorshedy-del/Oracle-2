@@ -104,6 +104,9 @@ PASSIVE_FILL_RATIO = 0.15  # odds of a resting maker order filling without a ful
 PASSIVE_FILL_DISTANCE_BPS = 100  # resting quote can fill if within 1% of the reference price
 MAKER_REBATE_BPS = 10  # ~0.1% maker rebate (estimate)
 TAKER_FEE_MAX_BPS = 156  # 1.56% max taker fee at 50% probability
+SETTLEMENT_CHECK_INTERVAL_SEC = 30
+SETTLEMENT_WINNER_MIN_PRICE = 0.99
+SETTLEMENT_LOSER_MAX_PRICE = 0.01
 
 # ═══════════════════════════════════════════
 #  AUTO TUNER (CatBoost Training)
@@ -111,6 +114,7 @@ TAKER_FEE_MAX_BPS = 156  # 1.56% max taker fee at 50% probability
 MIN_SAMPLES_TO_TRAIN = 5000  # minimum rows before first training
 RETRAIN_INTERVAL_ROWS = 2000  # retrain every N new rows
 TRAIN_TEST_SPLIT = 0.8
+TRAIN_VALIDATION_GAP_SEC = 60  # keep 60s between train/test to avoid overlap
 CATBOOST_ITERATIONS = 500
 CATBOOST_DEPTH = 6
 CATBOOST_LEARNING_RATE = 0.05
