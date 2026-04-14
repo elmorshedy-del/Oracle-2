@@ -75,9 +75,10 @@ class PolymarketBot:
         self.tuning_interval = 300  # run tuner every 5 minutes
         self.last_status_time = 0
         self.status_interval = 30  # print status every 30 seconds
+        self.last_settlement_check = 0
+        self.settlement_interval = config.SETTLEMENT_CHECK_INTERVAL_SEC
         self.last_day = None
         self._last_mid = 0.50  # previous tick's mid price (for fill simulation)
-        self._last_settlement_check = 0  # last time we checked for resolved markets
 
         # Load model if exists
         if config.USE_MODEL_IF_AVAILABLE and os.path.exists(config.MODEL_PATH):
@@ -221,10 +222,10 @@ class PolymarketBot:
             except Exception:
                 pass
 
-        # ── Step 5: Check market settlements ──
-        if now - self._last_settlement_check > config.SETTLEMENT_CHECK_INTERVAL:
-            self._last_settlement_check = now
-            await self._check_settlements()
+        # ── Step 5: Settle resolved markets ──
+        if now - self.last_settlement_check > self.settlement_interval:
+            self.last_settlement_check = now
+            await self._settle_resolved_markets()
 
         # ── Step 6: Log tick ──
         tick_data = {
@@ -259,39 +260,6 @@ class PolymarketBot:
         if now - self.last_status_time > self.status_interval:
             self.last_status_time = now
             self._print_status(decision, sig1, fills)
-
-    async def _check_settlements(self):
-        """
-        Check if any markets we hold positions in have resolved.
-        Settle them into realized P&L.
-        """
-        for market_id, pos in list(self.risk.positions.items()):
-            if pos.yes_shares == 0 and pos.no_shares == 0:
-                continue
-            if market_id in self.trader._settled_markets:
-                continue
-
-            # Check if market has resolved via Polymarket API
-            for market in self.polymarket.active_markets:
-                if market.get("id") == market_id:
-                    # Check if end_date has passed
-                    end_date = market.get("end_date", "")
-                    if end_date:
-                        try:
-                            from datetime import timezone
-                            end_ts = datetime.fromisoformat(
-                                end_date.replace("Z", "+00:00")
-                            ).timestamp()
-                            if time.time() > end_ts:
-                                # Market expired — simulate resolution
-                                # Use last known mid to determine winner
-                                mid = self._last_mid or 0.5
-                                winning_side = "YES" if mid >= 0.5 else "NO"
-                                pnl = self.trader.settle_market(market_id, winning_side)
-                                if pnl != 0:
-                                    log.info(f"  Market {market_id[:16]} resolved → {winning_side}, PnL=${pnl:+.2f}")
-                        except Exception as e:
-                            log.debug(f"Settlement check error: {e}")
 
     def _print_status(self, decision, binance_signal, fills):
         """Print a compact status line."""
@@ -350,6 +318,43 @@ class PolymarketBot:
             })
         except Exception as e:
             log.error(f"Failed to save daily PnL: {e}")
+
+    async def _settle_resolved_markets(self):
+        """Resolve markets once Polymarket exposes a decisive outcome."""
+        market_ids = list(self.risk.positions.keys())
+        for market_id in market_ids:
+            if database.is_market_settled(self.db, market_id):
+                continue
+
+            market = await self.polymarket.fetch_market_metadata(market_id)
+            settlement = self.polymarket.get_settlement_info(market)
+            if not settlement:
+                continue
+
+            result = self.risk.settle_market(
+                market_id,
+                settlement["payout_yes"],
+                settlement["payout_no"],
+            )
+            if not result:
+                continue
+
+            self.trader.cancel_all(market_id=market_id)
+            database.record_market_settlement(self.db, {
+                "market_id": market_id,
+                "settled_at": time.time(),
+                "winning_side": settlement["winning_side"],
+                "payout_yes": settlement["payout_yes"],
+                "payout_no": settlement["payout_no"],
+                "num_yes_shares": result["num_yes_shares"],
+                "num_no_shares": result["num_no_shares"],
+                "realized_pnl": result["realized_pnl"],
+                "source": settlement["source"],
+            })
+            log.info(
+                f"  SETTLED: {market_id[:8]} winner={settlement['winning_side']} "
+                f"pnl=${result['realized_pnl']:+.2f}"
+            )
 
     async def shutdown(self):
         """Clean shutdown."""

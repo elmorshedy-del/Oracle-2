@@ -333,6 +333,62 @@ class PolymarketFeed:
             "clob_token_ids": token_ids,
         }
 
+    async def fetch_market_metadata(self, market_id: str):
+        """Fetch full Gamma metadata for a market, including closed markets."""
+        try:
+            url = f"{config.GAMMA_API_URL}/markets"
+            params = {"conditionId": market_id}
+            async with self._session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+                ssl=self._ssl_context,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+
+                data = await resp.json()
+                if isinstance(data, list) and data:
+                    return data[0]
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            log.debug(f"Settlement metadata fetch failed for {market_id[:8]}: {e}")
+        return None
+
+    def get_settlement_info(self, market: dict):
+        """Return payout info when Gamma exposes a decisive binary resolution."""
+        if not market:
+            return None
+
+        outcome_prices = self._parse_json_field(market.get("outcomePrices", []))
+        if not isinstance(outcome_prices, list) or len(outcome_prices) < 2:
+            return None
+
+        try:
+            payout_yes = float(outcome_prices[0])
+            payout_no = float(outcome_prices[1])
+        except (TypeError, ValueError):
+            return None
+
+        if payout_yes >= config.SETTLEMENT_WINNER_MIN_PRICE and payout_no <= config.SETTLEMENT_LOSER_MAX_PRICE:
+            return {
+                "winning_side": "YES",
+                "payout_yes": 1.0,
+                "payout_no": 0.0,
+                "source": "gamma-outcome-prices",
+            }
+
+        if payout_no >= config.SETTLEMENT_WINNER_MIN_PRICE and payout_yes <= config.SETTLEMENT_LOSER_MAX_PRICE:
+            return {
+                "winning_side": "NO",
+                "payout_yes": 0.0,
+                "payout_no": 1.0,
+                "source": "gamma-outcome-prices",
+            }
+
+        return None
+
     async def update(self):
         """Refresh markets periodically and fetch orderbooks."""
         if time.time() - self._last_market_refresh > config.MARKET_REFRESH_INTERVAL:

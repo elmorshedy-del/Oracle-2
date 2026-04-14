@@ -330,6 +330,39 @@ class RiskManager:
         self.balance += rebate
         self.peak_balance = max(self.peak_balance, self.balance)
 
+    def settle_market(self, market_id: str, payout_yes: float, payout_no: float):
+        """Resolve a binary market into cash and realized PnL."""
+        pos = self.positions.get(market_id)
+        if not pos:
+            return None
+
+        yes_shares = pos.yes_shares
+        no_shares = pos.no_shares
+        yes_cost = yes_shares * pos.yes_avg_cost
+        no_cost = no_shares * pos.no_avg_cost
+        payout = yes_shares * payout_yes + no_shares * payout_no
+        realized_pnl = (payout - yes_cost - no_cost)
+
+        self.balance += payout
+        pos.realized_pnl += realized_pnl
+        pos.total_cost = 0.0
+        pos.yes_shares = 0.0
+        pos.no_shares = 0.0
+        pos.yes_avg_cost = 0.0
+        pos.no_avg_cost = 0.0
+        self.peak_balance = max(self.peak_balance, self.balance)
+        del self.positions[market_id]
+
+        return {
+            "market_id": market_id,
+            "num_yes_shares": yes_shares,
+            "num_no_shares": no_shares,
+            "payout_yes": payout_yes,
+            "payout_no": payout_no,
+            "payout": round(payout, 4),
+            "realized_pnl": round(realized_pnl, 4),
+        }
+
     def reset_daily(self):
         """Reset daily tracking at start of new day."""
         self.daily_starting_balance = self.balance

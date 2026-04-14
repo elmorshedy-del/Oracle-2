@@ -106,6 +106,21 @@ def init_db(path=None):
         )
     """)
 
+    # ── Market settlement log ──
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS market_settlements (
+            market_id TEXT PRIMARY KEY,
+            settled_at REAL,
+            winning_side TEXT,
+            payout_yes REAL,
+            payout_no REAL,
+            num_yes_shares REAL,
+            num_no_shares REAL,
+            realized_pnl REAL,
+            source TEXT
+        )
+    """)
+
     conn.commit()
     return conn
 
@@ -221,6 +236,27 @@ def get_daily_pnl(conn, date_str):
     return conn.execute(
         "SELECT * FROM daily_pnl WHERE date=?", (date_str,)
     ).fetchone()
+
+
+def is_market_settled(conn, market_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM market_settlements WHERE market_id=? LIMIT 1",
+        (market_id,),
+    ).fetchone()
+    return bool(row)
+
+
+def record_market_settlement(conn, data: dict):
+    conn.execute("""
+        INSERT OR REPLACE INTO market_settlements (
+            market_id, settled_at, winning_side, payout_yes, payout_no,
+            num_yes_shares, num_no_shares, realized_pnl, source
+        ) VALUES (
+            :market_id, :settled_at, :winning_side, :payout_yes, :payout_no,
+            :num_yes_shares, :num_no_shares, :realized_pnl, :source
+        )
+    """, data)
+    conn.commit()
 
 
 def upsert_daily_pnl(conn, data: dict):

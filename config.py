@@ -103,8 +103,10 @@ MIN_TRADABLE_SPREAD = 0.20  # skip markets with spread > 20¢ (untradable book)
 # ═══════════════════════════════════════════
 #  SETTLEMENT (Market Resolution)
 # ═══════════════════════════════════════════
-SETTLEMENT_CHECK_INTERVAL = 60  # seconds between checking for resolved markets
 SETTLEMENT_PAYOUT = 1.0  # winning side pays $1.00 per share
+SETTLEMENT_CHECK_INTERVAL_SEC = 30
+SETTLEMENT_WINNER_MIN_PRICE = 0.99
+SETTLEMENT_LOSER_MAX_PRICE = 0.01
 
 # ═══════════════════════════════════════════
 #  AUTO TUNER (CatBoost Training)
