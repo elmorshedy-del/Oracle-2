@@ -163,16 +163,23 @@ class PolymarketBot:
         # ── Classify regime ──
         decision = self.classifier.classify(combined)
 
-        # ── Cancel stale orders before placing new ones ──
-        self.trader.cancel_all()
-
-        # ── Generate paper orders ──
-        if not self.risk.halted:
-            orders = self.trader.generate_orders(decision, sig2)
-
         # ── Simulate fills ──
         mid = sig2.get("poly_mid_price")
         fills = self.trader.simulate_fills(mid)
+        for fill in fills:
+            order = fill["order"]
+            if order.db_trade_id is not None:
+                database.mark_fill(
+                    self.db,
+                    order.db_trade_id,
+                    order.fill_price,
+                    round(fill["realized_pnl"] + fill["rebate"], 4),
+                )
+
+        # ── Generate paper orders ──
+        orders = []
+        if not self.risk.halted:
+            orders = self.trader.generate_orders(decision, sig2)
 
         # ── Log tick to database ──
         tick_data = {
@@ -188,10 +195,10 @@ class PolymarketBot:
         except Exception as e:
             log.error(f"DB log error: {e}")
 
-        # Log paper trades
-        for order in self.trader.open_orders[-len(orders) if orders else 0:]:
+        # Log newly placed paper trades
+        for order in orders:
             try:
-                database.log_paper_trade(self.db, {
+                order.db_trade_id = database.log_paper_trade(self.db, {
                     "timestamp": order.timestamp,
                     "market_id": order.market_id,
                     "side": order.side,

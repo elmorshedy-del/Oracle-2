@@ -36,6 +36,7 @@ class PaperOrder:
     mode: int = 1
     lean_direction: float = 0.0
     lean_confidence: float = 0.0
+    db_trade_id: Optional[int] = None
 
 
 @dataclass
@@ -282,11 +283,12 @@ class RiskManager:
 
     def update_position(self, market_id: str, side: str, shares: float,
                         price: float, is_buy: bool):
-        """Update position after a fill."""
+        """Update position after a fill and return realized PnL for this action."""
         if market_id not in self.positions:
             self.positions[market_id] = Position(market_id=market_id)
 
         pos = self.positions[market_id]
+        realized_pnl = 0.0
 
         if is_buy:
             cost = shares * price
@@ -317,8 +319,15 @@ class RiskManager:
             pos.realized_pnl += pnl
             pos.total_cost = max(0, pos.total_cost - revenue)
             self.balance += revenue
+            realized_pnl = pnl
 
         # Track peak
+        self.peak_balance = max(self.peak_balance, self.balance)
+        return realized_pnl
+
+    def apply_rebate(self, rebate: float):
+        """Credit maker rebates directly to balance."""
+        self.balance += rebate
         self.peak_balance = max(self.peak_balance, self.balance)
 
     def reset_daily(self):
@@ -365,9 +374,11 @@ class PaperTrader:
         Generate paper orders based on the current regime decision
         and polymarket orderbook state.
         """
+        self._expire_orders()
+
         mid = poly_signal.get("poly_mid_price")
         market_id = poly_signal.get("poly_market_id") or "paper_market"
-        spread = poly_signal.get("poly_spread") or 0.04
+        spread = self._quote_spread()
 
         if mid is None:
             # Use a synthetic mid price for testing when no market data
@@ -389,13 +400,22 @@ class PaperTrader:
 
         # Risk check each order
         approved = []
+        active_keys = {
+            (o.market_id, o.side, o.order_type)
+            for o in self.open_orders
+            if not o.filled
+        }
         for order in orders:
+            order_key = (order.market_id, order.side, order.order_type)
+            if order_key in active_keys:
+                continue
             allowed, adj_size, reason = self.risk.check_order(
                 order.market_id, order.side, order.size, order.price
             )
             if allowed and adj_size > 0:
                 order.size = adj_size
                 approved.append(order)
+                active_keys.add(order_key)
 
         self.open_orders.extend(approved)
         self.total_orders_placed += len(approved)
@@ -479,6 +499,18 @@ class PaperTrader:
                           round(1.0 - mid - 0.01, 3), size, decision))
         return orders
 
+    def _quote_spread(self) -> float:
+        """Use the configured paper spread instead of a raw live-book spread."""
+        return max(config.SPREAD_BPS / 10000, 0.02)
+
+    def _expire_orders(self):
+        """Drop resting quotes that have gone stale."""
+        now = time.time()
+        self.open_orders = [
+            order for order in self.open_orders
+            if order.filled or now - order.timestamp <= config.ORDER_TTL_SEC
+        ]
+
     def simulate_fills(self, current_mid: float):
         """
         Check if any open paper orders would have filled based on
@@ -487,6 +519,7 @@ class PaperTrader:
         - ASK fills if price rises to or above ask price
         Plus randomness to simulate partial fills and queue position.
         """
+        self._expire_orders()
         if current_mid is None:
             return []
 
@@ -497,10 +530,6 @@ class PaperTrader:
             if order.filled:
                 remaining.append(order)
                 continue
-
-            # Age-based expiry: cancel orders older than 30 seconds
-            if time.time() - order.timestamp > 30:
-                continue  # drop expired orders
 
             filled = False
 
@@ -517,6 +546,13 @@ class PaperTrader:
                 # Price rose to our ask — potential fill
                 if random.random() < config.FILL_PROBABILITY:
                     filled = True
+            else:
+                # Resting maker quotes can still get lifted/hit without a full cross.
+                distance = abs(ref_price - order.price)
+                passive_distance = config.PASSIVE_FILL_DISTANCE_BPS / 10000
+                passive_fill_prob = config.FILL_PROBABILITY * config.PASSIVE_FILL_RATIO
+                if distance <= passive_distance and random.random() < passive_fill_prob:
+                    filled = True
 
             if filled:
                 order.filled = True
@@ -526,7 +562,7 @@ class PaperTrader:
 
                 # Update risk manager
                 is_buy = order.order_type == "BID"
-                self.risk.update_position(
+                realized_pnl = self.risk.update_position(
                     order.market_id, order.side,
                     order.size, order.fill_price, is_buy
                 )
@@ -534,10 +570,12 @@ class PaperTrader:
                 # Calculate paper PnL for this fill
                 # Maker rebate
                 rebate = order.size * order.price * (config.MAKER_REBATE_BPS / 10000)
+                self.risk.apply_rebate(rebate)
 
                 fills.append({
                     "order": order,
                     "rebate": rebate,
+                    "realized_pnl": realized_pnl,
                 })
                 log.info(
                     f"  FILL: {order.order_type} {order.size} {order.side} "
