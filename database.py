@@ -9,6 +9,7 @@ import time
 import json
 
 import config
+from model_features import model_feature_names
 
 
 def init_db(path=None):
@@ -184,31 +185,20 @@ def get_tick_count(conn):
 
 def get_training_data(conn):
     """Pull labeled tick data for CatBoost training."""
-    query = """
+    feature_columns = model_feature_names()
+    select_columns = ",\n            ".join(
+        ["timestamp", *feature_columns, "optimal_lean"]
+    )
+    query = f"""
         SELECT
-            btc_price, btc_momentum, btc_direction, btc_velocity,
-            poly_yes_best_bid, poly_yes_best_ask, poly_no_best_bid,
-            poly_no_best_ask, poly_mid_price, poly_spread,
-            poly_orderbook_imbalance, poly_volume_24h,
-            poly_seconds_remaining,
-            kalshi_yes_price, kalshi_no_price, cross_platform_spread,
-            btc_price_after_30s, btc_price_after_60s, btc_price_after_300s,
-            optimal_lean
+            {select_columns}
         FROM ticks
         WHERE btc_price_after_60s IS NOT NULL
           AND optimal_lean IS NOT NULL
+        ORDER BY timestamp ASC
     """
     rows = conn.execute(query).fetchall()
-    columns = [
-        "btc_price", "btc_momentum", "btc_direction", "btc_velocity",
-        "poly_yes_best_bid", "poly_yes_best_ask", "poly_no_best_bid",
-        "poly_no_best_ask", "poly_mid_price", "poly_spread",
-        "poly_orderbook_imbalance", "poly_volume_24h",
-        "poly_seconds_remaining",
-        "kalshi_yes_price", "kalshi_no_price", "cross_platform_spread",
-        "btc_price_after_30s", "btc_price_after_60s", "btc_price_after_300s",
-        "optimal_lean"
-    ]
+    columns = ["timestamp", *feature_columns, "optimal_lean"]
     return rows, columns
 
 

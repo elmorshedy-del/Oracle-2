@@ -167,7 +167,10 @@ class PolymarketBot:
 
         # ── Simulate fills ──
         mid = sig2.get("poly_mid_price")
-        fills = self.trader.simulate_fills(mid)
+        fills = self.trader.simulate_fills(
+            mid,
+            market_id=sig2.get("poly_market_id"),
+        )
         for fill in fills:
             order = fill["order"]
             if order.db_trade_id is not None:
