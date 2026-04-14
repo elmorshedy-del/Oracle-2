@@ -26,134 +26,106 @@ log = logging.getLogger("signals")
 
 class BinanceFeed:
     """
-    BTC/USDT real-time price feed.
+    BTC/USD real-time price feed via HTTPS polling.
     
-    Tries WebSocket first (fastest, ~100ms updates).
-    Falls back to REST polling (works on Railway where WS may be blocked).
+    Uses Coinbase and Kraken public endpoints (no auth needed).
+    Polls every 1 second for smooth price updates.
+    Name kept as BinanceFeed for compatibility with rest of codebase.
     """
 
-    # REST fallback endpoints (no auth needed)
-    REST_ENDPOINTS = [
-        "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+    PRICE_FEEDS = [
+        ("coinbase_exchange", "https://api.exchange.coinbase.com/products/BTC-USD/ticker"),
+        ("coinbase_spot", "https://api.coinbase.com/v2/prices/BTC-USD/spot"),
+        ("kraken", "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"),
     ]
 
     def __init__(self):
         self.price = None
         self.history = deque(maxlen=500)  # (timestamp, price)
         self.connected = False
-        self._ws = None
-        self._ws_task = None
-        self._rest_task = None
-        self._rest_session = None
-        self._use_rest = False
+        self._session = None
+        self._task = None
+        self._active_feed = None
 
     async def start(self):
-        """Start price feed — tries WebSocket, falls back to REST."""
-        self._rest_session = aiohttp.ClientSession()
-        self._ws_task = asyncio.create_task(self._ws_connect_loop())
-        self._rest_task = asyncio.create_task(self._rest_fallback_monitor())
+        """Start HTTPS price polling."""
+        try:
+            import certifi
+            import ssl
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+        except ImportError:
+            connector = None
+
+        self._session = aiohttp.ClientSession(connector=connector)
+        self._task = asyncio.create_task(self._poll_loop())
         log.info("BTC price feed starting...")
 
-    async def _rest_fallback_monitor(self):
-        """Wait for WS to connect; if it doesn't, start REST polling."""
-        await asyncio.sleep(8)
-        if not self.connected:
-            log.info("BTC WebSocket unavailable — switching to REST polling")
-            self._use_rest = True
-            await self._rest_poll_loop()
-
     async def stop(self):
-        if self._ws_task:
-            self._ws_task.cancel()
-        if self._rest_task:
-            self._rest_task.cancel()
-        if self._ws:
-            await self._ws.close()
-        if self._rest_session:
-            await self._rest_session.close()
+        if self._task:
+            self._task.cancel()
+        if self._session:
+            await self._session.close()
 
-    async def _ws_connect_loop(self):
-        """WebSocket reconnect loop with backoff."""
-        backoff = 1
+    async def _poll_loop(self):
+        """Poll price feeds every 1 second."""
         while True:
             try:
-                async with websockets.connect(
-                    config.BINANCE_WS_URL,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5,
-                ) as ws:
-                    self._ws = ws
-                    self.connected = True
-                    self._use_rest = False
-                    backoff = 1
-                    log.info("BTC WebSocket connected")
-
-                    # Cancel REST fallback if it's running
-                    if self._rest_task and not self._rest_task.done():
-                        self._rest_task.cancel()
-
-                    async for msg in ws:
-                        try:
-                            data = json.loads(msg)
-                            p = float(data["p"])
-                            t = float(data["T"]) / 1000.0
-                            self.price = p
-                            self.history.append((t, p))
-                        except (KeyError, ValueError):
-                            continue
-
-            except (Exception,) as e:
-                self.connected = False
-                if not self._use_rest:
-                    log.debug(f"BTC WS error: {e}. Retry in {backoff}s")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-            except asyncio.CancelledError:
-                break
-
-    async def _rest_poll_loop(self):
-        """REST polling fallback — polls every 2 seconds."""
-        log.info("BTC REST price feed started")
-        while True:
-            try:
-                price = await self._fetch_rest_price()
+                price = await self._fetch_price()
                 if price:
                     now = time.time()
                     self.price = price
                     self.history.append((now, price))
-                    self.connected = True
-                await asyncio.sleep(2)
+                    if not self.connected:
+                        self.connected = True
+                        log.info(f"BTC price feed connected via {self._active_feed}: ${price:,.0f}")
+                await asyncio.sleep(1)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.debug(f"BTC REST error: {e}")
-                await asyncio.sleep(5)
+                self.connected = False
+                log.debug(f"BTC price poll error: {e}")
+                await asyncio.sleep(3)
 
-    async def _fetch_rest_price(self) -> float:
-        """Try REST endpoints in order."""
-        # Try Binance REST first
+    async def _fetch_price(self) -> float:
+        """Try each feed endpoint in order until one works."""
+
+        # 1. Coinbase Exchange
         try:
-            async with self._rest_session.get(
-                self.REST_ENDPOINTS[0],
-                timeout=aiohttp.ClientTimeout(total=5)
+            async with self._session.get(
+                self.PRICE_FEEDS[0][1],
+                timeout=aiohttp.ClientTimeout(total=3)
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    self._active_feed = "coinbase_exchange"
                     return float(data["price"])
         except Exception:
             pass
 
-        # Fallback: CoinGecko
+        # 2. Coinbase Spot
         try:
-            async with self._rest_session.get(
-                self.REST_ENDPOINTS[1],
-                timeout=aiohttp.ClientTimeout(total=5)
+            async with self._session.get(
+                self.PRICE_FEEDS[1][1],
+                timeout=aiohttp.ClientTimeout(total=3)
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data["bitcoin"]["usd"])
+                    self._active_feed = "coinbase_spot"
+                    return float(data["data"]["amount"])
+        except Exception:
+            pass
+
+        # 3. Kraken
+        try:
+            async with self._session.get(
+                self.PRICE_FEEDS[2][1],
+                timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._active_feed = "kraken"
+                    return float(data["result"]["XXBTZUSD"]["c"][0])
         except Exception:
             pass
 
