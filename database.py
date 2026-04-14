@@ -9,6 +9,7 @@ import time
 import json
 
 import config
+from model_features import model_feature_names
 
 
 def init_db(path=None):
@@ -106,6 +107,21 @@ def init_db(path=None):
         )
     """)
 
+    # ── Market settlement log ──
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS market_settlements (
+            market_id TEXT PRIMARY KEY,
+            settled_at REAL,
+            winning_side TEXT,
+            payout_yes REAL,
+            payout_no REAL,
+            num_yes_shares REAL,
+            num_no_shares REAL,
+            realized_pnl REAL,
+            source TEXT
+        )
+    """)
+
     conn.commit()
     return conn
 
@@ -140,6 +156,7 @@ def log_paper_trade(conn, data: dict):
     col_str = ",".join(columns)
     conn.execute(f"INSERT INTO paper_trades ({col_str}) VALUES ({placeholders})", values)
     conn.commit()
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
 def mark_fill(conn, trade_id, fill_price, pnl):
@@ -168,31 +185,20 @@ def get_tick_count(conn):
 
 def get_training_data(conn):
     """Pull labeled tick data for CatBoost training."""
-    query = """
+    feature_columns = model_feature_names()
+    select_columns = ",\n            ".join(
+        ["timestamp", *feature_columns, "optimal_lean"]
+    )
+    query = f"""
         SELECT
-            btc_price, btc_momentum, btc_direction, btc_velocity,
-            poly_yes_best_bid, poly_yes_best_ask, poly_no_best_bid,
-            poly_no_best_ask, poly_mid_price, poly_spread,
-            poly_orderbook_imbalance, poly_volume_24h,
-            poly_seconds_remaining,
-            kalshi_yes_price, kalshi_no_price, cross_platform_spread,
-            btc_price_after_30s, btc_price_after_60s, btc_price_after_300s,
-            optimal_lean
+            {select_columns}
         FROM ticks
         WHERE btc_price_after_60s IS NOT NULL
           AND optimal_lean IS NOT NULL
+        ORDER BY timestamp ASC
     """
     rows = conn.execute(query).fetchall()
-    columns = [
-        "btc_price", "btc_momentum", "btc_direction", "btc_velocity",
-        "poly_yes_best_bid", "poly_yes_best_ask", "poly_no_best_bid",
-        "poly_no_best_ask", "poly_mid_price", "poly_spread",
-        "poly_orderbook_imbalance", "poly_volume_24h",
-        "poly_seconds_remaining",
-        "kalshi_yes_price", "kalshi_no_price", "cross_platform_spread",
-        "btc_price_after_30s", "btc_price_after_60s", "btc_price_after_300s",
-        "optimal_lean"
-    ]
+    columns = ["timestamp", *feature_columns, "optimal_lean"]
     return rows, columns
 
 
@@ -220,6 +226,27 @@ def get_daily_pnl(conn, date_str):
     return conn.execute(
         "SELECT * FROM daily_pnl WHERE date=?", (date_str,)
     ).fetchone()
+
+
+def is_market_settled(conn, market_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM market_settlements WHERE market_id=? LIMIT 1",
+        (market_id,),
+    ).fetchone()
+    return bool(row)
+
+
+def record_market_settlement(conn, data: dict):
+    conn.execute("""
+        INSERT OR REPLACE INTO market_settlements (
+            market_id, settled_at, winning_side, payout_yes, payout_no,
+            num_yes_shares, num_no_shares, realized_pnl, source
+        ) VALUES (
+            :market_id, :settled_at, :winning_side, :payout_yes, :payout_no,
+            :num_yes_shares, :num_no_shares, :realized_pnl, :source
+        )
+    """, data)
+    conn.commit()
 
 
 def upsert_daily_pnl(conn, data: dict):

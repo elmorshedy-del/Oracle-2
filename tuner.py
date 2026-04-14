@@ -117,7 +117,43 @@ def should_train(conn) -> bool:
     return False
 
 
-def train_model(conn) -> dict:
+def _split_chronologically(timestamps, X, y):
+    """Split sequential data without letting adjacent future windows overlap."""
+    split_idx = int(len(timestamps) * config.TRAIN_TEST_SPLIT)
+    split_idx = min(max(split_idx, 1), len(timestamps) - 1)
+    split_time = timestamps[split_idx]
+    gap_seconds = config.TRAIN_VALIDATION_GAP_SEC
+
+    train_mask = timestamps <= split_time - gap_seconds
+    test_mask = timestamps >= split_time + gap_seconds
+
+    if not np.any(train_mask) or not np.any(test_mask):
+        gap_rows = max(1, int(np.ceil(gap_seconds / max(config.POLL_INTERVAL_SEC, 1))))
+        train_end = max(1, split_idx - gap_rows)
+        test_start = min(len(timestamps) - 1, split_idx + gap_rows)
+
+        train_mask = np.zeros(len(timestamps), dtype=bool)
+        test_mask = np.zeros(len(timestamps), dtype=bool)
+        train_mask[:train_end] = True
+        test_mask[test_start:] = True
+
+    if not np.any(train_mask) or not np.any(test_mask):
+        raise ValueError("Not enough separated samples for chronological validation")
+
+    return {
+        "X_train": X[train_mask],
+        "X_test": X[test_mask],
+        "y_train": y[train_mask],
+        "y_test": y[test_mask],
+        "train_start": float(timestamps[train_mask][0]),
+        "train_end": float(timestamps[train_mask][-1]),
+        "test_start": float(timestamps[test_mask][0]),
+        "test_end": float(timestamps[test_mask][-1]),
+        "gap_seconds": gap_seconds,
+    }
+
+
+def train_model(conn, model_path=None, min_accuracy=None, log_run=True, train_dir=None) -> dict:
     """
     Train CatBoost on collected data.
 
@@ -127,7 +163,9 @@ def train_model(conn) -> dict:
     Returns dict with training results.
     """
     from catboost import CatBoostRegressor, Pool
-    from sklearn.model_selection import train_test_split
+
+    model_path = model_path or config.MODEL_PATH
+    min_accuracy = config.MODEL_MIN_ACCURACY if min_accuracy is None else min_accuracy
 
     rows, columns = database.get_training_data(conn)
     if len(rows) < config.MIN_SAMPLES_TO_TRAIN:
@@ -141,15 +179,23 @@ def train_model(conn) -> dict:
     # Handle NaN/None → fill with 0
     data = np.nan_to_num(data, nan=0.0)
 
-    # Features = all columns except the last (optimal_lean)
-    feature_names = columns[:-1]
-    X = data[:, :-1]
+    # The first column is timestamp; the last is the target.
+    timestamps = data[:, 0]
+    feature_names = columns[1:-1]
+    X = data[:, 1:-1]
     y = data[:, -1]
 
-    # Split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=1 - config.TRAIN_TEST_SPLIT, random_state=42
+    split = _split_chronologically(timestamps, X, y)
+    X_train = split["X_train"]
+    X_test = split["X_test"]
+    y_train = split["y_train"]
+    y_test = split["y_test"]
+
+    train_dir = train_dir or os.path.join(
+        os.path.dirname(model_path) or ".",
+        "catboost_info",
     )
+    os.makedirs(train_dir, exist_ok=True)
 
     # Train
     model = CatBoostRegressor(
@@ -158,6 +204,7 @@ def train_model(conn) -> dict:
         learning_rate=config.CATBOOST_LEARNING_RATE,
         loss_function="RMSE",
         verbose=False,
+        train_dir=train_dir,
     )
 
     train_pool = Pool(X_train, y_train, feature_names=feature_names)
@@ -177,16 +224,25 @@ def train_model(conn) -> dict:
     train_rmse = np.sqrt(np.mean((train_preds - y_train) ** 2))
     test_rmse = np.sqrt(np.mean((test_preds - y_test) ** 2))
 
+    majority_sign = 1.0 if np.sum(np.sign(y_train) >= 0) >= np.sum(np.sign(y_train) < 0) else -1.0
+    baseline_acc = np.mean(np.sign(np.full_like(y_test, majority_sign)) == np.sign(y_test))
+
     # Feature importance
     importance = dict(zip(feature_names, model.get_feature_importance().tolist()))
     top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:5]
 
     result = {
         "num_samples": len(rows),
-        "train_accuracy": round(train_dir_acc, 4),
-        "test_accuracy": round(test_dir_acc, 4),
-        "train_rmse": round(train_rmse, 4),
-        "test_rmse": round(test_rmse, 4),
+        "train_samples": int(len(y_train)),
+        "test_samples": int(len(y_test)),
+        "train_accuracy": round(float(train_dir_acc), 4),
+        "test_accuracy": round(float(test_dir_acc), 4),
+        "baseline_accuracy": round(float(baseline_acc), 4),
+        "train_rmse": round(float(train_rmse), 4),
+        "test_rmse": round(float(test_rmse), 4),
+        "train_window": [split["train_start"], split["train_end"]],
+        "test_window": [split["test_start"], split["test_end"]],
+        "validation_gap_sec": split["gap_seconds"],
         "feature_importance": importance,
         "top_features": top_features,
         "deployed": False,
@@ -194,31 +250,35 @@ def train_model(conn) -> dict:
 
     log.info(f"  Train directional accuracy: {train_dir_acc:.2%}")
     log.info(f"  Test directional accuracy:  {test_dir_acc:.2%}")
+    log.info(f"  Baseline accuracy:          {baseline_acc:.2%}")
     log.info(f"  Test RMSE:                 {test_rmse:.4f}")
     log.info(f"  Top features: {top_features}")
 
     # Deploy if good enough
-    if test_dir_acc >= config.MODEL_MIN_ACCURACY:
-        os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
-        model.save_model(config.MODEL_PATH)
+    if test_dir_acc >= min_accuracy:
+        model_dir = os.path.dirname(model_path) or "."
+        os.makedirs(model_dir, exist_ok=True)
+        model.save_model(model_path)
         result["deployed"] = True
-        log.info(f"  Model deployed to {config.MODEL_PATH}")
+        result["model_path"] = model_path
+        log.info(f"  Model deployed to {model_path}")
     else:
         log.info(
             f"  Model not deployed: {test_dir_acc:.2%} < "
-            f"{config.MODEL_MIN_ACCURACY:.2%} threshold"
+            f"{min_accuracy:.2%} threshold"
         )
 
     # Log training run
-    conn.execute("""
-        INSERT INTO training_log (timestamp, num_samples, train_accuracy,
-            test_accuracy, feature_importance, model_deployed)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        time.time(), len(rows), train_dir_acc, test_dir_acc,
-        json.dumps(importance), 1 if result["deployed"] else 0
-    ))
-    conn.commit()
+    if log_run:
+        conn.execute("""
+            INSERT INTO training_log (timestamp, num_samples, train_accuracy,
+                test_accuracy, feature_importance, model_deployed)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            time.time(), len(rows), train_dir_acc, test_dir_acc,
+            json.dumps(importance), 1 if result["deployed"] else 0
+        ))
+        conn.commit()
 
     return result
 
