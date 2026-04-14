@@ -76,6 +76,8 @@ class PolymarketBot:
         self.last_status_time = 0
         self.status_interval = 30  # print status every 30 seconds
         self.last_day = None
+        self._last_mid = 0.50  # previous tick's mid price (for fill simulation)
+        self._last_settlement_check = 0  # last time we checked for resolved markets
 
         # Load model if exists
         if config.USE_MODEL_IF_AVAILABLE and os.path.exists(config.MODEL_PATH):
@@ -110,7 +112,17 @@ class PolymarketBot:
             await self.shutdown()
 
     async def _tick(self):
-        """One cycle of the main loop."""
+        """
+        One cycle of the main loop.
+
+        FIXED lifecycle order:
+        1. Simulate fills on EXISTING orders (they've had time to work)
+        2. Expire stale orders (age-based, not cancel-all)
+        3. Gather signals + classify regime
+        4. Replenish quotes only if needed
+        5. Check for market settlements
+        6. Log everything
+        """
         self.tick_count += 1
         now = time.time()
 
@@ -122,7 +134,39 @@ class PolymarketBot:
             self.risk.reset_daily()
             self.last_day = today
 
-        # ── Gather signals ──
+        # ── Step 1: Simulate fills on EXISTING orders ──
+        # This runs BEFORE placing new orders so old quotes get
+        # a real chance to fill based on price movement since last tick
+        mid = self._last_mid  # mid from previous tick
+        sig2 = self.polymarket.get_signal()
+        new_mid = sig2.get("poly_mid_price")
+        if new_mid is not None:
+            self._last_mid = new_mid
+
+        fills = self.trader.simulate_fills(new_mid if new_mid is not None else mid)
+
+        # Log fills to database
+        for fill in fills:
+            order = fill["order"]
+            try:
+                database.log_paper_trade(self.db, {
+                    "timestamp": order.fill_timestamp,
+                    "market_id": order.market_id,
+                    "side": order.side,
+                    "order_type": order.order_type,
+                    "price": order.fill_price,
+                    "size": order.size,
+                    "mode": order.mode,
+                    "lean_direction": order.lean_direction,
+                    "lean_confidence": order.lean_confidence,
+                })
+            except Exception:
+                pass
+
+        # ── Step 2: Expire stale orders (NOT cancel-all) ──
+        self.trader.expire_stale_orders()
+
+        # ── Step 3: Gather signals + classify ──
         try:
             await self.polymarket.update()
         except Exception as e:
@@ -133,63 +177,35 @@ class PolymarketBot:
         except Exception as e:
             log.debug(f"Kalshi update error: {e}")
 
-        # Signal 1: Binance
         sig1 = self.binance.get_signal()
         short_momentum = self.binance.get_short_momentum(seconds=10)
 
-        # Record price history for backfill
         if sig1["btc_price"]:
             self.price_history.append((now, sig1["btc_price"]))
 
-        # Signal 2: Polymarket
-        sig2 = self.polymarket.get_signal()
-
-        # Signal 3: Kalshi
+        sig2 = self.polymarket.get_signal()  # refresh after update
         sig3 = self.kalshi.get_signal(poly_mid=sig2.get("poly_mid_price"))
 
-        # Signal 4: News + LLM
         try:
             await self.news_llm.update(poly_mid=sig2.get("poly_mid_price"))
         except Exception as e:
             log.debug(f"News/LLM update error: {e}")
         sig4 = self.news_llm.get_signal()
 
-        # ── Combine signals ──
         combined = {
             **sig1, **sig2, **sig3, **sig4,
             "short_momentum": short_momentum,
         }
 
-        # ── Classify regime ──
         decision = self.classifier.classify(combined)
 
-        # ── Cancel stale orders before placing new ones ──
-        self.trader.cancel_all()
-
-        # ── Generate paper orders ──
+        # ── Step 4: Replenish quotes only if needed ──
+        orders = []
         if not self.risk.halted:
             orders = self.trader.generate_orders(decision, sig2)
 
-        # ── Simulate fills ──
-        mid = sig2.get("poly_mid_price")
-        fills = self.trader.simulate_fills(mid)
-
-        # ── Log tick to database ──
-        tick_data = {
-            **combined,
-            "timestamp": now,
-            "mode": decision.mode,
-            "lean_direction": decision.lean_direction,
-            "lean_confidence": decision.lean_confidence,
-            "classifier_source": decision.source,
-        }
-        try:
-            tick_id = database.log_tick(self.db, tick_data)
-        except Exception as e:
-            log.error(f"DB log error: {e}")
-
-        # Log paper trades
-        for order in self.trader.open_orders[-len(orders) if orders else 0:]:
+        # Log new orders
+        for order in orders:
             try:
                 database.log_paper_trade(self.db, {
                     "timestamp": order.timestamp,
@@ -204,6 +220,25 @@ class PolymarketBot:
                 })
             except Exception:
                 pass
+
+        # ── Step 5: Check market settlements ──
+        if now - self._last_settlement_check > config.SETTLEMENT_CHECK_INTERVAL:
+            self._last_settlement_check = now
+            await self._check_settlements()
+
+        # ── Step 6: Log tick ──
+        tick_data = {
+            **combined,
+            "timestamp": now,
+            "mode": decision.mode,
+            "lean_direction": decision.lean_direction,
+            "lean_confidence": decision.lean_confidence,
+            "classifier_source": decision.source,
+        }
+        try:
+            tick_id = database.log_tick(self.db, tick_data)
+        except Exception as e:
+            log.error(f"DB log error: {e}")
 
         # ── Run tuner periodically ──
         if now - self.last_tuning_time > self.tuning_interval:
@@ -224,6 +259,39 @@ class PolymarketBot:
         if now - self.last_status_time > self.status_interval:
             self.last_status_time = now
             self._print_status(decision, sig1, fills)
+
+    async def _check_settlements(self):
+        """
+        Check if any markets we hold positions in have resolved.
+        Settle them into realized P&L.
+        """
+        for market_id, pos in list(self.risk.positions.items()):
+            if pos.yes_shares == 0 and pos.no_shares == 0:
+                continue
+            if market_id in self.trader._settled_markets:
+                continue
+
+            # Check if market has resolved via Polymarket API
+            for market in self.polymarket.active_markets:
+                if market.get("id") == market_id:
+                    # Check if end_date has passed
+                    end_date = market.get("end_date", "")
+                    if end_date:
+                        try:
+                            from datetime import timezone
+                            end_ts = datetime.fromisoformat(
+                                end_date.replace("Z", "+00:00")
+                            ).timestamp()
+                            if time.time() > end_ts:
+                                # Market expired — simulate resolution
+                                # Use last known mid to determine winner
+                                mid = self._last_mid or 0.5
+                                winning_side = "YES" if mid >= 0.5 else "NO"
+                                pnl = self.trader.settle_market(market_id, winning_side)
+                                if pnl != 0:
+                                    log.info(f"  Market {market_id[:16]} resolved → {winning_side}, PnL=${pnl:+.2f}")
+                        except Exception as e:
+                            log.debug(f"Settlement check error: {e}")
 
     def _print_status(self, decision, binance_signal, fills):
         """Print a compact status line."""
