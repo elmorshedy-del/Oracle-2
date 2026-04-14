@@ -213,50 +213,125 @@ class PolymarketFeed:
             await self._session.close()
 
     async def _refresh_markets(self):
-        """Find active BTC prediction markets via Gamma API."""
-        try:
-            url = f"{config.GAMMA_API_URL}/markets"
-            params = {"closed": "false", "limit": 100}
-            async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    all_markets = await resp.json()
-                    btc_markets = []
-                    for m in all_markets:
-                        q = (m.get("question", "") + " " + m.get("description", "")).lower()
-                        slug = m.get("slug", "").lower()
+        """
+        Find active short-term BTC prediction markets.
+        
+        Strategy: try multiple Gamma API queries targeting the
+        5-min and 15-min BTC up/down markets specifically.
+        These rotate every 5/15 minutes so we need fresh lookups.
+        """
+        btc_markets = []
 
-                        # Accept any market mentioning bitcoin/btc
-                        is_btc = any(tag in q or tag in slug for tag in ["bitcoin", "btc"])
-                        if not is_btc:
-                            continue
+        # Strategy 1: Search by slug pattern (most reliable)
+        for slug_keyword in ["btc-updown-5m", "btc-updown-15m", "btc-updown-1h",
+                             "bitcoin-up-or-down"]:
+            try:
+                url = f"{config.GAMMA_API_URL}/markets"
+                params = {
+                    "closed": "false",
+                    "slug_contains": slug_keyword,
+                    "limit": 10,
+                }
+                async with self._session.get(url, params=params,
+                                             timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        markets = await resp.json()
+                        for m in markets:
+                            btc_markets.append(self._parse_market(m))
+            except Exception as e:
+                log.debug(f"Slug search '{slug_keyword}' failed: {e}")
 
-                        # Prefer short-term markets but accept all BTC markets
-                        token_ids = m.get("clobTokenIds", [])
-                        market_data = {
-                            "id": m.get("conditionId", ""),
-                            "question": m.get("question", ""),
-                            "slug": m.get("slug", ""),
-                            "end_date": m.get("endDate", ""),
-                            "volume_24h": float(m.get("volume24hr", 0) or 0),
-                            "yes_token_id": token_ids[0] if len(token_ids) >= 1 else "",
-                            "no_token_id": token_ids[1] if len(token_ids) >= 2 else "",
-                            "outcomes": m.get("outcomes", []),
-                            "clob_token_ids": token_ids,
-                        }
-                        btc_markets.append(market_data)
+        # Strategy 2: Search by tag
+        if not btc_markets:
+            for tag in ["btc", "crypto"]:
+                try:
+                    url = f"{config.GAMMA_API_URL}/markets"
+                    params = {"closed": "false", "tag": tag, "limit": 50}
+                    async with self._session.get(url, params=params,
+                                                 timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status == 200:
+                            markets = await resp.json()
+                            for m in markets:
+                                q = (m.get("question", "") + m.get("slug", "")).lower()
+                                if any(kw in q for kw in ["up or down", "updown", "up/down"]):
+                                    btc_markets.append(self._parse_market(m))
+                except Exception as e:
+                    log.debug(f"Tag search '{tag}' failed: {e}")
 
-                    # Sort by volume — most active first
-                    btc_markets.sort(key=lambda x: x["volume_24h"], reverse=True)
-                    self.active_markets = btc_markets[:20]
-                    self._last_market_refresh = time.time()
+        # Strategy 3: Events endpoint
+        if not btc_markets:
+            try:
+                url = f"{config.GAMMA_API_URL}/events"
+                params = {"closed": "false", "limit": 100}
+                async with self._session.get(url, params=params,
+                                             timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        events = await resp.json()
+                        for event in events:
+                            slug = event.get("slug", "").lower()
+                            title = event.get("title", "").lower()
+                            if any(kw in slug or kw in title for kw in
+                                   ["btc-updown", "bitcoin-up", "btc-up"]):
+                                for m in event.get("markets", []):
+                                    btc_markets.append(self._parse_market(m))
+            except Exception as e:
+                log.debug(f"Events search failed: {e}")
 
-                    if btc_markets:
-                        top = btc_markets[0]
-                        log.info(f"  Top market: {top['question'][:60]} (vol: ${top['volume_24h']:,.0f})")
-                else:
-                    log.warning(f"Gamma API returned {resp.status}")
-        except Exception as e:
-            log.error(f"Market refresh failed: {e}")
+        # Strategy 4: Broad fallback — any BTC market
+        if not btc_markets:
+            try:
+                url = f"{config.GAMMA_API_URL}/markets"
+                params = {"closed": "false", "limit": 100}
+                async with self._session.get(url, params=params,
+                                             timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        all_markets = await resp.json()
+                        for m in all_markets:
+                            q = (m.get("question", "") + " " + m.get("slug", "")).lower()
+                            if any(tag in q for tag in ["bitcoin", "btc"]):
+                                btc_markets.append(self._parse_market(m))
+            except Exception as e:
+                log.debug(f"Broad search failed: {e}")
+
+        # Deduplicate by id
+        seen = set()
+        unique = []
+        for m in btc_markets:
+            if m["id"] and m["id"] not in seen:
+                seen.add(m["id"])
+                unique.append(m)
+
+        # Sort: short-term markets first (by end_date), then by volume
+        def sort_key(m):
+            # Prefer markets ending soonest (short-term)
+            end = m.get("end_date", "z")
+            vol = m.get("volume_24h", 0)
+            return (end, -vol)
+
+        unique.sort(key=sort_key)
+        self.active_markets = unique[:20]
+        self._last_market_refresh = time.time()
+
+        if unique:
+            top = unique[0]
+            log.info(f"  Top market: {top['question'][:70]} (vol: ${top['volume_24h']:,.0f})")
+        else:
+            log.warning("  No BTC markets found via any strategy")
+
+    def _parse_market(self, m: dict) -> dict:
+        """Parse a Gamma API market object into our standard format."""
+        token_ids = m.get("clobTokenIds", [])
+        return {
+            "id": m.get("conditionId", ""),
+            "question": m.get("question", ""),
+            "slug": m.get("slug", ""),
+            "end_date": m.get("endDate", ""),
+            "volume_24h": float(m.get("volume24hr", 0) or 0),
+            "yes_token_id": token_ids[0] if len(token_ids) >= 1 else "",
+            "no_token_id": token_ids[1] if len(token_ids) >= 2 else "",
+            "outcomes": m.get("outcomes", []),
+            "clob_token_ids": token_ids,
+        }
 
     async def update(self):
         """Refresh markets periodically and fetch orderbooks."""
