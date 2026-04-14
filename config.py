@@ -24,9 +24,14 @@ LOG_DB_PATH = "data/trades.db"
 MODEL_PATH = "data/catboost_model.cbm"
 
 # ═══════════════════════════════════════════
-#  BINANCE FEED (Signal 1: Market Data)
+#  BTC PRICE FEED (Signal 1: Market Data)
 # ═══════════════════════════════════════════
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+BTC_PRICE_POLL_INTERVAL_SEC = 2
+BTC_PRICE_FEEDS = [
+    "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+    "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+    "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+]
 BINANCE_MOMENTUM_WINDOW = 15  # seconds of price history for momentum calc
 BINANCE_DIRECTION_THRESHOLD = 0.0015  # 0.15% move = directional signal
 
@@ -35,6 +40,8 @@ BINANCE_DIRECTION_THRESHOLD = 0.0015  # 0.15% move = directional signal
 # ═══════════════════════════════════════════
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_API_URL = "https://clob.polymarket.com"
+POLYMARKET_SEARCH_QUERY = "bitcoin"
+POLYMARKET_MARKET_LIMIT = 25
 MARKET_SLUGS = [
     "will-bitcoin-go-up-or-down-in-the-next-5-minutes",
     "will-bitcoin-go-up-or-down-in-the-next-15-minutes",

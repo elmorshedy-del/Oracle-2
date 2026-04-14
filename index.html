@@ -373,7 +373,7 @@
   <div class="topbar-right">
     <span>
       <span class="conn-dot off" id="conn-binance"></span>
-      <span class="conn-label">Binance</span>
+      <span class="conn-label">BTC Feed</span>
     </span>
     <span>
       <span class="conn-dot off" id="conn-poly"></span>
@@ -456,7 +456,7 @@
     <div class="explain">
       <strong>How it works:</strong> The bot runs 4 modes simultaneously.
       <strong>Mode 1 (Quiet)</strong> places symmetric buy/sell orders on both sides, earning the spread + maker rebates.
-      <strong>Mode 2 (Lean)</strong> activates when Binance shows BTC moving — quotes shift to favor the predicted direction.
+      <strong>Mode 2 (Lean)</strong> activates when the BTC feed shows momentum — quotes shift to favor the predicted direction.
       <strong>Mode 3 (Event)</strong> fires on breaking news (LLM-assessed) or extreme BTC moves — aggressive one-sided orders.
       <strong>Mode 4 (Arb)</strong> triggers when Kalshi and Polymarket price the same event differently — locks in cross-platform profit.
       Mode 1 is always running; the others modify its behavior.

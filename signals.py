@@ -1,7 +1,7 @@
 """
 Signal feeds — three data sources feeding the regime classifier.
 
-Signal 1: Binance WebSocket (BTC real-time price, momentum, velocity)
+Signal 1: BTC price feed (real-time-ish price, momentum, velocity)
 Signal 2: Polymarket public API (orderbook state, market discovery)
 Signal 3: Kalshi public API (cross-platform price comparison)
 """
@@ -10,14 +10,20 @@ import asyncio
 import json
 import time
 import logging
+import ssl
 from collections import deque
 
 import aiohttp
-import websockets
+import certifi
 
 import config
 
 log = logging.getLogger("signals")
+
+
+def build_ssl_context():
+    """Use certifi so aiohttp trusts the same CA bundle as requests."""
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 # ═══════════════════════════════════════════════════════
@@ -26,61 +32,104 @@ log = logging.getLogger("signals")
 
 class BinanceFeed:
     """
-    Connects to Binance trade WebSocket for real-time BTC/USDT price.
-    Maintains a rolling window to compute momentum and velocity.
+    Maintains a rolling BTC price window from public spot endpoints
+    to compute momentum and velocity.
     """
 
     def __init__(self):
         self.price = None
         self.history = deque(maxlen=500)  # (timestamp, price)
         self.connected = False
-        self._ws = None
+        self.source = None
+        self._session = None
         self._task = None
+        self._ssl_context = build_ssl_context()
 
     async def start(self):
-        """Start WebSocket connection in background."""
-        self._task = asyncio.create_task(self._connect_loop())
-        log.info("Binance feed starting...")
+        """Start background polling."""
+        self._session = aiohttp.ClientSession()
+        self._task = asyncio.create_task(self._poll_loop())
+        log.info("BTC price feed starting...")
 
     async def stop(self):
         if self._task:
             self._task.cancel()
-        if self._ws:
-            await self._ws.close()
+        if self._session:
+            await self._session.close()
 
-    async def _connect_loop(self):
-        """Reconnect loop with backoff."""
+    async def _poll_loop(self):
+        """Poll reachable spot endpoints with retry/backoff."""
         backoff = 1
         while True:
             try:
-                async with websockets.connect(
-                    config.BINANCE_WS_URL,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5,
-                ) as ws:
-                    self._ws = ws
-                    self.connected = True
-                    backoff = 1
-                    log.info("Binance WebSocket connected")
+                price, source = await self._fetch_price()
+                now = time.time()
+                self.price = price
+                self.history.append((now, price))
 
-                    async for msg in ws:
-                        try:
-                            data = json.loads(msg)
-                            p = float(data["p"])  # trade price
-                            t = float(data["T"]) / 1000.0  # trade time (ms → s)
-                            self.price = p
-                            self.history.append((t, p))
-                        except (KeyError, ValueError):
-                            continue
+                if source != self.source or not self.connected:
+                    log.info(f"BTC price feed connected via {source}")
 
-            except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
-                self.connected = False
-                log.warning(f"Binance WS disconnected: {e}. Retry in {backoff}s")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                self.source = source
+                self.connected = True
+                backoff = 1
+                await asyncio.sleep(config.BTC_PRICE_POLL_INTERVAL_SEC)
             except asyncio.CancelledError:
                 break
+            except Exception as e:
+                self.connected = False
+                log.warning(f"BTC price feed unavailable: {e}. Retry in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+
+    async def _fetch_price(self):
+        """Try public spot sources in order until one returns a price."""
+        errors = []
+
+        for url in config.BTC_PRICE_FEEDS:
+            try:
+                async with self._session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    headers={"Accept": "application/json"},
+                    ssl=self._ssl_context,
+                ) as resp:
+                    if resp.status != 200:
+                        errors.append(f"{url} -> {resp.status}")
+                        continue
+
+                    data = await resp.json()
+                    price = self._extract_price(url, data)
+                    if price:
+                        return price, self._source_name(url)
+                    errors.append(f"{url} -> missing price")
+            except Exception as e:
+                errors.append(f"{url} -> {e}")
+
+        raise RuntimeError("; ".join(errors))
+
+    @staticmethod
+    def _source_name(url: str) -> str:
+        if "coinbase.com/v2" in url:
+            return "Coinbase Spot"
+        if "exchange.coinbase.com" in url:
+            return "Coinbase Exchange"
+        if "kraken.com" in url:
+            return "Kraken"
+        return "BTC Feed"
+
+    @staticmethod
+    def _extract_price(url: str, data: dict):
+        if "exchange.coinbase.com" in url:
+            return float(data.get("price", 0) or 0)
+        if "coinbase.com/v2" in url:
+            return float(data.get("data", {}).get("amount", 0) or 0)
+        if "kraken.com" in url:
+            result = data.get("result", {})
+            if result:
+                first_market = next(iter(result.values()))
+                return float(first_market.get("c", [0])[0] or 0)
+        return None
 
     def get_signal(self) -> dict:
         """
@@ -153,6 +202,7 @@ class PolymarketFeed:
         self.orderbooks = {}  # market_id → orderbook dict
         self._session = None
         self._last_market_refresh = 0
+        self._ssl_context = build_ssl_context()
 
     async def start(self):
         self._session = aiohttp.ClientSession()
@@ -166,41 +216,68 @@ class PolymarketFeed:
     async def _refresh_markets(self):
         """Find active BTC prediction markets via Gamma API."""
         try:
-            # Search for BTC up/down markets
             url = f"{config.GAMMA_API_URL}/markets"
-            params = {"closed": "false", "limit": 50}
-            async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            params = {
+                "closed": "false",
+                "limit": config.POLYMARKET_MARKET_LIMIT,
+                "search": config.POLYMARKET_SEARCH_QUERY,
+            }
+            async with self._session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+                ssl=self._ssl_context,
+            ) as resp:
                 if resp.status == 200:
                     all_markets = await resp.json()
-                    # Filter for BTC short-term markets
                     btc_markets = []
                     for m in all_markets:
-                        q = (m.get("question", "") + m.get("description", "")).lower()
-                        if any(tag in q for tag in ["bitcoin", "btc"]) and \
-                           any(kw in q for kw in ["up or down", "above", "below", "5 min", "15 min", "1 hour"]):
-                            btc_markets.append({
-                                "id": m.get("conditionId", ""),
-                                "question": m.get("question", ""),
-                                "slug": m.get("slug", ""),
-                                "end_date": m.get("endDate", ""),
-                                "volume_24h": float(m.get("volume24hr", 0)),
-                                "yes_token_id": "",
-                                "no_token_id": "",
-                                "outcomes": m.get("outcomes", []),
-                                "clob_token_ids": m.get("clobTokenIds", []),
-                            })
-                            # Parse token IDs
-                            token_ids = m.get("clobTokenIds", [])
-                            if len(token_ids) >= 2:
-                                btc_markets[-1]["yes_token_id"] = token_ids[0]
-                                btc_markets[-1]["no_token_id"] = token_ids[1]
+                        if m.get("closed") or not m.get("active", True):
+                            continue
 
+                        q = (m.get("question", "") + m.get("description", "")).lower()
+                        if not any(tag in q for tag in ["bitcoin", "btc"]):
+                            continue
+
+                        token_ids = self._parse_json_field(m.get("clobTokenIds", []))
+                        outcomes = self._parse_json_field(m.get("outcomes", []))
+                        if not isinstance(token_ids, list) or len(token_ids) < 2:
+                            continue
+
+                        btc_markets.append({
+                            "id": m.get("conditionId", ""),
+                            "question": m.get("question", ""),
+                            "slug": m.get("slug", ""),
+                            "end_date": m.get("endDate", ""),
+                            "volume_24h": float(m.get("volume24hr", 0) or 0),
+                            "yes_token_id": token_ids[0],
+                            "no_token_id": token_ids[1],
+                            "outcomes": outcomes if isinstance(outcomes, list) else [],
+                            "clob_token_ids": token_ids,
+                        })
+
+                    btc_markets.sort(
+                        key=lambda m: (
+                            0 if any(term in m["question"].lower() for term in ["5 min", "15 min", "1 hour", "today", "this week"]) else 1,
+                            -m["volume_24h"],
+                            m["end_date"] or "9999",
+                        )
+                    )
                     self.active_markets = btc_markets
                     self._last_market_refresh = time.time()
                 else:
                     log.warning(f"Gamma API returned {resp.status}")
         except Exception as e:
             log.error(f"Market refresh failed: {e}")
+
+    @staticmethod
+    def _parse_json_field(value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
 
     async def update(self):
         """Refresh markets periodically and fetch orderbooks."""
@@ -218,7 +295,12 @@ class PolymarketFeed:
         try:
             url = f"{config.CLOB_API_URL}/book"
             params = {"token_id": yes_id}
-            async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with self._session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=5),
+                ssl=self._ssl_context,
+            ) as resp:
                 if resp.status == 200:
                     book = await resp.json()
                     self.orderbooks[market["id"]] = {
@@ -323,6 +405,7 @@ class KalshiFeed:
         self.prices = {}  # event_ticker → {yes_price, no_price}
         self._session = None
         self._last_poll = 0
+        self._ssl_context = build_ssl_context()
 
     async def start(self):
         self._session = aiohttp.ClientSession()
@@ -344,7 +427,8 @@ class KalshiFeed:
             }
             headers = {"Accept": "application/json"}
             async with self._session.get(url, params=params, headers=headers,
-                                         timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                         timeout=aiohttp.ClientTimeout(total=10),
+                                         ssl=self._ssl_context) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     self.markets = data.get("markets", [])

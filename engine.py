@@ -151,7 +151,7 @@ class RegimeClassifier:
             )
 
         # ── Mode 2: Informed lean ──
-        # Moderate directional signal from Binance
+        # Moderate directional signal from the BTC price feed
         abs_momentum = abs(btc_momentum)
         if abs_momentum >= config.LEAN_BINANCE_THRESHOLD:
             direction = 1.0 if btc_momentum > 0 else -1.0
@@ -167,7 +167,7 @@ class RegimeClassifier:
                 lean_direction=direction,
                 lean_confidence=round(confidence, 3),
                 source="rules",
-                reason=f"Binance lean: momentum={btc_momentum:.4%}, "
+                reason=f"BTC feed lean: momentum={btc_momentum:.4%}, "
                        f"OB imbalance={orderbook_imbalance:.3f}"
             )
 
