@@ -41,7 +41,7 @@ MARKET_SLUGS = [
 ]
 # Fallback: search by tag
 MARKET_TAGS = ["btc", "bitcoin"]
-MARKET_REFRESH_INTERVAL = 60  # seconds between checking for new markets
+MARKET_REFRESH_INTERVAL = 30  # seconds between checking for new markets (short-term rotate fast)
 
 # ═══════════════════════════════════════════
 #  NEWS / LLM SIGNAL (Signal 2: Event Detection)
