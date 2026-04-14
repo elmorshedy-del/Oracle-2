@@ -26,30 +26,55 @@ log = logging.getLogger("signals")
 
 class BinanceFeed:
     """
-    Connects to Binance trade WebSocket for real-time BTC/USDT price.
-    Maintains a rolling window to compute momentum and velocity.
+    BTC/USDT real-time price feed.
+    
+    Tries WebSocket first (fastest, ~100ms updates).
+    Falls back to REST polling (works on Railway where WS may be blocked).
     """
+
+    # REST fallback endpoints (no auth needed)
+    REST_ENDPOINTS = [
+        "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+        "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+    ]
 
     def __init__(self):
         self.price = None
         self.history = deque(maxlen=500)  # (timestamp, price)
         self.connected = False
         self._ws = None
-        self._task = None
+        self._ws_task = None
+        self._rest_task = None
+        self._rest_session = None
+        self._use_rest = False
 
     async def start(self):
-        """Start WebSocket connection in background."""
-        self._task = asyncio.create_task(self._connect_loop())
-        log.info("Binance feed starting...")
+        """Start price feed — tries WebSocket, falls back to REST."""
+        self._rest_session = aiohttp.ClientSession()
+        self._ws_task = asyncio.create_task(self._ws_connect_loop())
+        self._rest_task = asyncio.create_task(self._rest_fallback_monitor())
+        log.info("BTC price feed starting...")
+
+    async def _rest_fallback_monitor(self):
+        """Wait for WS to connect; if it doesn't, start REST polling."""
+        await asyncio.sleep(8)
+        if not self.connected:
+            log.info("BTC WebSocket unavailable — switching to REST polling")
+            self._use_rest = True
+            await self._rest_poll_loop()
 
     async def stop(self):
-        if self._task:
-            self._task.cancel()
+        if self._ws_task:
+            self._ws_task.cancel()
+        if self._rest_task:
+            self._rest_task.cancel()
         if self._ws:
             await self._ws.close()
+        if self._rest_session:
+            await self._rest_session.close()
 
-    async def _connect_loop(self):
-        """Reconnect loop with backoff."""
+    async def _ws_connect_loop(self):
+        """WebSocket reconnect loop with backoff."""
         backoff = 1
         while True:
             try:
@@ -61,26 +86,78 @@ class BinanceFeed:
                 ) as ws:
                     self._ws = ws
                     self.connected = True
+                    self._use_rest = False
                     backoff = 1
-                    log.info("Binance WebSocket connected")
+                    log.info("BTC WebSocket connected")
+
+                    # Cancel REST fallback if it's running
+                    if self._rest_task and not self._rest_task.done():
+                        self._rest_task.cancel()
 
                     async for msg in ws:
                         try:
                             data = json.loads(msg)
-                            p = float(data["p"])  # trade price
-                            t = float(data["T"]) / 1000.0  # trade time (ms → s)
+                            p = float(data["p"])
+                            t = float(data["T"]) / 1000.0
                             self.price = p
                             self.history.append((t, p))
                         except (KeyError, ValueError):
                             continue
 
-            except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
+            except (Exception,) as e:
                 self.connected = False
-                log.warning(f"Binance WS disconnected: {e}. Retry in {backoff}s")
+                if not self._use_rest:
+                    log.debug(f"BTC WS error: {e}. Retry in {backoff}s")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff * 2, 60)
             except asyncio.CancelledError:
                 break
+
+    async def _rest_poll_loop(self):
+        """REST polling fallback — polls every 2 seconds."""
+        log.info("BTC REST price feed started")
+        while True:
+            try:
+                price = await self._fetch_rest_price()
+                if price:
+                    now = time.time()
+                    self.price = price
+                    self.history.append((now, price))
+                    self.connected = True
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug(f"BTC REST error: {e}")
+                await asyncio.sleep(5)
+
+    async def _fetch_rest_price(self) -> float:
+        """Try REST endpoints in order."""
+        # Try Binance REST first
+        try:
+            async with self._rest_session.get(
+                self.REST_ENDPOINTS[0],
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data["price"])
+        except Exception:
+            pass
+
+        # Fallback: CoinGecko
+        try:
+            async with self._rest_session.get(
+                self.REST_ENDPOINTS[1],
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data["bitcoin"]["usd"])
+        except Exception:
+            pass
+
+        return None
 
     def get_signal(self) -> dict:
         """
@@ -166,37 +243,44 @@ class PolymarketFeed:
     async def _refresh_markets(self):
         """Find active BTC prediction markets via Gamma API."""
         try:
-            # Search for BTC up/down markets
             url = f"{config.GAMMA_API_URL}/markets"
-            params = {"closed": "false", "limit": 50}
+            params = {"closed": "false", "limit": 100}
             async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     all_markets = await resp.json()
-                    # Filter for BTC short-term markets
                     btc_markets = []
                     for m in all_markets:
-                        q = (m.get("question", "") + m.get("description", "")).lower()
-                        if any(tag in q for tag in ["bitcoin", "btc"]) and \
-                           any(kw in q for kw in ["up or down", "above", "below", "5 min", "15 min", "1 hour"]):
-                            btc_markets.append({
-                                "id": m.get("conditionId", ""),
-                                "question": m.get("question", ""),
-                                "slug": m.get("slug", ""),
-                                "end_date": m.get("endDate", ""),
-                                "volume_24h": float(m.get("volume24hr", 0)),
-                                "yes_token_id": "",
-                                "no_token_id": "",
-                                "outcomes": m.get("outcomes", []),
-                                "clob_token_ids": m.get("clobTokenIds", []),
-                            })
-                            # Parse token IDs
-                            token_ids = m.get("clobTokenIds", [])
-                            if len(token_ids) >= 2:
-                                btc_markets[-1]["yes_token_id"] = token_ids[0]
-                                btc_markets[-1]["no_token_id"] = token_ids[1]
+                        q = (m.get("question", "") + " " + m.get("description", "")).lower()
+                        slug = m.get("slug", "").lower()
 
-                    self.active_markets = btc_markets
+                        # Accept any market mentioning bitcoin/btc
+                        is_btc = any(tag in q or tag in slug for tag in ["bitcoin", "btc"])
+                        if not is_btc:
+                            continue
+
+                        # Prefer short-term markets but accept all BTC markets
+                        token_ids = m.get("clobTokenIds", [])
+                        market_data = {
+                            "id": m.get("conditionId", ""),
+                            "question": m.get("question", ""),
+                            "slug": m.get("slug", ""),
+                            "end_date": m.get("endDate", ""),
+                            "volume_24h": float(m.get("volume24hr", 0) or 0),
+                            "yes_token_id": token_ids[0] if len(token_ids) >= 1 else "",
+                            "no_token_id": token_ids[1] if len(token_ids) >= 2 else "",
+                            "outcomes": m.get("outcomes", []),
+                            "clob_token_ids": token_ids,
+                        }
+                        btc_markets.append(market_data)
+
+                    # Sort by volume — most active first
+                    btc_markets.sort(key=lambda x: x["volume_24h"], reverse=True)
+                    self.active_markets = btc_markets[:20]
                     self._last_market_refresh = time.time()
+
+                    if btc_markets:
+                        top = btc_markets[0]
+                        log.info(f"  Top market: {top['question'][:60]} (vol: ${top['volume_24h']:,.0f})")
                 else:
                     log.warning(f"Gamma API returned {resp.status}")
         except Exception as e:
