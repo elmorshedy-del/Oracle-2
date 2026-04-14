@@ -342,7 +342,6 @@ class PolymarketFeed:
                 url,
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=10),
-                ssl=self._ssl_context,
             ) as resp:
                 if resp.status != 200:
                     return None
@@ -361,7 +360,12 @@ class PolymarketFeed:
         if not market:
             return None
 
-        outcome_prices = self._parse_json_field(market.get("outcomePrices", []))
+        outcome_prices = market.get("outcomePrices", [])
+        if isinstance(outcome_prices, str):
+            try:
+                outcome_prices = json.loads(outcome_prices)
+            except json.JSONDecodeError:
+                return None
         if not isinstance(outcome_prices, list) or len(outcome_prices) < 2:
             return None
 
