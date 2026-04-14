@@ -151,7 +151,7 @@ class RegimeClassifier:
             )
 
         # ── Mode 2: Informed lean ──
-        # Moderate directional signal from the BTC price feed
+        # Moderate directional signal from Binance
         abs_momentum = abs(btc_momentum)
         if abs_momentum >= config.LEAN_BINANCE_THRESHOLD:
             direction = 1.0 if btc_momentum > 0 else -1.0
@@ -167,7 +167,7 @@ class RegimeClassifier:
                 lean_direction=direction,
                 lean_confidence=round(confidence, 3),
                 source="rules",
-                reason=f"BTC feed lean: momentum={btc_momentum:.4%}, "
+                reason=f"Binance lean: momentum={btc_momentum:.4%}, "
                        f"OB imbalance={orderbook_imbalance:.3f}"
             )
 
@@ -344,13 +344,14 @@ class RiskManager:
 
 class PaperTrader:
     """
-    Simulates market making on Polymarket. Places hypothetical
-    limit orders and simulates fills based on price movement.
+    Simulates market making on Polymarket.
 
-    Mode 1: Symmetric bids/asks around mid price
-    Mode 2: Asymmetric — tighter on the lean side, wider on other
-    Mode 3: One-sided aggressive — only lean side
-    Mode 4: Both legs of cross-platform arb
+    FIXED lifecycle:
+    1. simulate_fills() — check if EXISTING orders filled (using price movement)
+    2. expire_stale_orders() — remove only age-expired orders
+    3. replenish_quotes() — only place NEW orders if we're missing quotes
+    
+    Orders persist across ticks. They are NOT cancelled every cycle.
     """
 
     def __init__(self, risk_manager: RiskManager):
@@ -359,31 +360,143 @@ class PaperTrader:
         self._next_order_id = 1
         self.total_orders_placed = 0
         self.total_fills = 0
+        self._previous_mid: Optional[float] = None  # tracks mid between ticks
+        self._settled_markets: set = set()  # markets already settled
+
+    def simulate_fills(self, current_mid: float):
+        """
+        Check if EXISTING orders would have filled based on price movement
+        BETWEEN the previous tick and this tick.
+
+        Key fix: uses previous_mid → current_mid range to detect if price
+        crossed through an order's price level. This means orders placed
+        in a previous tick can fill when price moves in a subsequent tick.
+        """
+        if current_mid is None:
+            return []
+
+        prev_mid = self._previous_mid if self._previous_mid is not None else current_mid
+        self._previous_mid = current_mid
+
+        fills = []
+        remaining = []
+
+        for order in self.open_orders:
+            if order.filled:
+                remaining.append(order)
+                continue
+
+            filled = False
+
+            if order.side == "YES":
+                prev_ref = prev_mid
+                curr_ref = current_mid
+            else:
+                prev_ref = 1.0 - prev_mid
+                curr_ref = 1.0 - current_mid
+
+            # BID fills when price drops TO or THROUGH our bid level
+            # i.e., price was above our bid last tick, now at or below
+            if order.order_type == "BID":
+                if curr_ref <= order.price or (prev_ref > order.price and curr_ref <= order.price):
+                    if random.random() < config.FILL_PROBABILITY:
+                        filled = True
+
+            # ASK fills when price rises TO or THROUGH our ask level
+            elif order.order_type == "ASK":
+                if curr_ref >= order.price or (prev_ref < order.price and curr_ref >= order.price):
+                    if random.random() < config.FILL_PROBABILITY:
+                        filled = True
+
+            if filled:
+                order.filled = True
+                order.fill_price = order.price
+                order.fill_timestamp = time.time()
+                self.total_fills += 1
+
+                is_buy = order.order_type == "BID"
+                self.risk.update_position(
+                    order.market_id, order.side,
+                    order.size, order.fill_price, is_buy
+                )
+
+                rebate = order.size * order.price * (config.MAKER_REBATE_BPS / 10000)
+                self.risk.balance += rebate  # credit maker rebate
+
+                fills.append({
+                    "order": order,
+                    "rebate": rebate,
+                })
+                log.info(
+                    f"  FILL: {order.order_type} {order.size} {order.side} "
+                    f"@ {order.fill_price:.3f} (mode {order.mode}) +${rebate:.2f} rebate"
+                )
+            else:
+                remaining.append(order)
+
+        self.open_orders = remaining
+        return fills
+
+    def expire_stale_orders(self):
+        """
+        Remove orders older than ORDER_MAX_AGE_SEC.
+        This replaces the old cancel_all() — orders get a real lifetime.
+        """
+        now = time.time()
+        before = len(self.open_orders)
+        self.open_orders = [
+            o for o in self.open_orders
+            if not o.filled and (now - o.timestamp) < config.ORDER_MAX_AGE_SEC
+        ]
+        expired = before - len(self.open_orders)
+        if expired:
+            log.debug(f"  Expired {expired} stale orders")
+
+    def has_active_quotes(self, market_id: str) -> bool:
+        """Check if we already have active (unfilled) quotes for this market."""
+        active = [o for o in self.open_orders if not o.filled and o.market_id == market_id]
+        return len(active) >= 2  # at least one bid + one ask
 
     def generate_orders(self, decision: RegimeDecision, poly_signal: dict) -> List[PaperOrder]:
         """
-        Generate paper orders based on the current regime decision
-        and polymarket orderbook state.
+        Generate paper orders based on current regime.
+        
+        FIXED: Uses config.SPREAD_BPS for paper spread instead of live
+        poly_spread (which can be absurdly wide on illiquid markets).
+        Only places new orders if we don't already have active quotes.
         """
         mid = poly_signal.get("poly_mid_price")
         market_id = poly_signal.get("poly_market_id") or "paper_market"
-        spread = poly_signal.get("poly_spread") or 0.04
+        live_spread = poly_signal.get("poly_spread")
 
         if mid is None:
-            # Use a synthetic mid price for testing when no market data
             mid = 0.50
+
+        # FIXED: Use configured paper spread, not live spread
+        paper_spread = config.SPREAD_BPS / 10000.0  # 200 bps = 0.02
+        spread = paper_spread
+
+        # Filter: skip obviously non-tradable books
+        if live_spread is not None and live_spread > config.MIN_TRADABLE_SPREAD:
+            log.debug(f"  Skipping untradable market: spread={live_spread:.3f}")
+            return []
+
+        # Don't duplicate quotes if we already have active ones in quiet mode
+        if decision.mode == 1 and self.has_active_quotes(market_id):
+            return []
+
+        # For mode changes (2/3/4), cancel existing quotes and re-place
+        if decision.mode > 1:
+            self.cancel_all(market_id=market_id)
 
         orders = []
 
         if decision.mode == 1:
             orders = self._mode1_symmetric(market_id, mid, spread, decision)
-
         elif decision.mode == 2:
             orders = self._mode2_lean(market_id, mid, spread, decision)
-
         elif decision.mode == 3:
             orders = self._mode3_aggressive(market_id, mid, spread, decision)
-
         elif decision.mode == 4:
             orders = self._mode4_arb(market_id, mid, spread, decision)
 
@@ -402,8 +515,8 @@ class PaperTrader:
         return approved
 
     def _mode1_symmetric(self, market_id, mid, spread, decision) -> List[PaperOrder]:
-        """Symmetric quotes on both sides."""
-        half_spread = max(spread / 2, 0.01)
+        """Symmetric quotes on both sides using config paper spread."""
+        half_spread = max(spread / 2, 0.005)
         return [
             self._make_order(market_id, "YES", "BID", round(mid - half_spread, 3),
                              config.DEFAULT_ORDER_SIZE, decision),
@@ -417,23 +530,20 @@ class PaperTrader:
 
     def _mode2_lean(self, market_id, mid, spread, decision) -> List[PaperOrder]:
         """Asymmetric: tighter on lean side, wider on other."""
-        lean = decision.lean_direction  # +1 = bullish (favor YES)
+        lean = decision.lean_direction
         conf = decision.lean_confidence
-        half_spread = max(spread / 2, 0.01)
+        half_spread = max(spread / 2, 0.005)
 
-        # Tighten spread on favored side, widen on other
-        tight = half_spread * (1.0 - conf * 0.5)  # up to 50% tighter
-        wide = half_spread * (1.0 + conf * 0.5)   # up to 50% wider
+        tight = half_spread * (1.0 - conf * 0.5)
+        wide = half_spread * (1.0 + conf * 0.5)
 
         orders = []
         if lean > 0:
-            # Bullish: tight YES bid, wide YES ask
             orders.append(self._make_order(market_id, "YES", "BID",
                           round(mid - tight, 3), config.DEFAULT_ORDER_SIZE, decision))
             orders.append(self._make_order(market_id, "YES", "ASK",
                           round(mid + wide, 3), config.DEFAULT_ORDER_SIZE, decision))
         else:
-            # Bearish: tight NO bid, wide NO ask
             no_mid = 1.0 - mid
             orders.append(self._make_order(market_id, "NO", "BID",
                           round(no_mid - tight, 3), config.DEFAULT_ORDER_SIZE, decision))
@@ -446,11 +556,10 @@ class PaperTrader:
         """One-sided aggressive orders during events."""
         lean = decision.lean_direction
         conf = decision.lean_confidence
-        size = int(config.DEFAULT_ORDER_SIZE * (1.0 + conf))  # bigger size
+        size = int(config.DEFAULT_ORDER_SIZE * (1.0 + conf))
 
         orders = []
         if lean > 0:
-            # Bullish: aggressive YES bids at tighter prices
             orders.append(self._make_order(market_id, "YES", "BID",
                           round(mid - 0.005, 3), size, decision))
             orders.append(self._make_order(market_id, "YES", "BID",
@@ -466,7 +575,6 @@ class PaperTrader:
 
     def _mode4_arb(self, market_id, mid, spread, decision) -> List[PaperOrder]:
         """Cross-platform arb — place the Polymarket leg as maker."""
-        # In paper mode, simulate buying the cheap side
         lean = decision.lean_direction
         size = config.DEFAULT_ORDER_SIZE
 
@@ -479,84 +587,66 @@ class PaperTrader:
                           round(1.0 - mid - 0.01, 3), size, decision))
         return orders
 
-    def simulate_fills(self, current_mid: float):
+    def settle_market(self, market_id: str, winning_side: str):
         """
-        Check if any open paper orders would have filled based on
-        current market price movement. Simple model:
-        - BID fills if price drops to or below bid price
-        - ASK fills if price rises to or above ask price
-        Plus randomness to simulate partial fills and queue position.
+        Settle a resolved market: winning side pays $1.00, losing side pays $0.
+        
+        winning_side: 'YES' or 'NO'
         """
-        if current_mid is None:
-            return []
+        if market_id in self._settled_markets:
+            return 0.0  # already settled
 
-        fills = []
-        remaining = []
+        pos = self.risk.positions.get(market_id)
+        if not pos:
+            return 0.0
 
-        for order in self.open_orders:
-            if order.filled:
-                remaining.append(order)
-                continue
+        pnl = 0.0
 
-            # Age-based expiry: cancel orders older than 30 seconds
-            if time.time() - order.timestamp > 30:
-                continue  # drop expired orders
-
-            filled = False
-
-            if order.side == "YES":
-                ref_price = current_mid
+        # Settle YES shares
+        if pos.yes_shares > 0:
+            if winning_side == "YES":
+                payout = pos.yes_shares * config.SETTLEMENT_PAYOUT
+                pnl += payout - (pos.yes_shares * pos.yes_avg_cost)
+                self.risk.balance += payout
             else:
-                ref_price = 1.0 - current_mid
+                pnl -= pos.yes_shares * pos.yes_avg_cost
+                # shares worth $0, cost already deducted on purchase
 
-            if order.order_type == "BID" and ref_price <= order.price:
-                # Price dropped to our bid — potential fill
-                if random.random() < config.FILL_PROBABILITY:
-                    filled = True
-            elif order.order_type == "ASK" and ref_price >= order.price:
-                # Price rose to our ask — potential fill
-                if random.random() < config.FILL_PROBABILITY:
-                    filled = True
-
-            if filled:
-                order.filled = True
-                order.fill_price = order.price
-                order.fill_timestamp = time.time()
-                self.total_fills += 1
-
-                # Update risk manager
-                is_buy = order.order_type == "BID"
-                self.risk.update_position(
-                    order.market_id, order.side,
-                    order.size, order.fill_price, is_buy
-                )
-
-                # Calculate paper PnL for this fill
-                # Maker rebate
-                rebate = order.size * order.price * (config.MAKER_REBATE_BPS / 10000)
-
-                fills.append({
-                    "order": order,
-                    "rebate": rebate,
-                })
-                log.info(
-                    f"  FILL: {order.order_type} {order.size} {order.side} "
-                    f"@ {order.fill_price:.3f} (mode {order.mode}) +${rebate:.2f} rebate"
-                )
+        # Settle NO shares
+        if pos.no_shares > 0:
+            if winning_side == "NO":
+                payout = pos.no_shares * config.SETTLEMENT_PAYOUT
+                pnl += payout - (pos.no_shares * pos.no_avg_cost)
+                self.risk.balance += payout
             else:
-                remaining.append(order)
+                pnl -= pos.no_shares * pos.no_avg_cost
 
-        self.open_orders = remaining
-        return fills
+        pos.realized_pnl += pnl
+        pos.yes_shares = 0
+        pos.no_shares = 0
+        pos.total_cost = 0
+
+        # Cancel any remaining orders for this market
+        self.cancel_all(market_id=market_id)
+
+        self._settled_markets.add(market_id)
+
+        if pnl != 0:
+            log.info(
+                f"  SETTLED: {market_id[:16]}... winner={winning_side} "
+                f"PnL=${pnl:+.2f}"
+            )
+
+        return pnl
 
     def cancel_all(self, market_id=None, side=None):
         """Cancel open orders, optionally filtered by market/side."""
         before = len(self.open_orders)
         self.open_orders = [
             o for o in self.open_orders
-            if not o.filled and
-               (market_id is None or o.market_id != market_id) and
-               (side is None or o.side != side)
+            if o.filled or
+               (market_id is not None and o.market_id != market_id) or
+               (side is not None and o.side != side)
         ]
         cancelled = before - len(self.open_orders)
         if cancelled:
@@ -582,10 +672,11 @@ class PaperTrader:
 
     def get_stats(self) -> dict:
         return {
-            "open_orders": len(self.open_orders),
+            "open_orders": len([o for o in self.open_orders if not o.filled]),
             "total_placed": self.total_orders_placed,
             "total_fills": self.total_fills,
             "fill_rate": (
                 round(self.total_fills / max(1, self.total_orders_placed), 3)
             ),
+            "settled_markets": len(self._settled_markets),
         }
