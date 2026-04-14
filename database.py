@@ -140,6 +140,7 @@ def log_paper_trade(conn, data: dict):
     col_str = ",".join(columns)
     conn.execute(f"INSERT INTO paper_trades ({col_str}) VALUES ({placeholders})", values)
     conn.commit()
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
 def mark_fill(conn, trade_id, fill_price, pnl):
