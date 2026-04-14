@@ -144,7 +144,10 @@ class PolymarketBot:
         if new_mid is not None:
             self._last_mid = new_mid
 
-        fills = self.trader.simulate_fills(new_mid if new_mid is not None else mid)
+        fills = self.trader.simulate_fills(
+            new_mid if new_mid is not None else mid,
+            market_id=sig2.get("poly_market_id"),
+        )
 
         # Log fills to database
         for fill in fills:

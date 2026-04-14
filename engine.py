@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import config
+from model_features import feature_vector_from_signals, model_feature_names
 
 log = logging.getLogger("engine")
 
@@ -73,6 +74,8 @@ class RegimeClassifier:
     def __init__(self):
         self._catboost_model = None
         self._use_model = False
+        self._model_prediction_ok = False
+        self._model_error = ""
 
     def load_model(self, model_path):
         """Load trained CatBoost model to replace rules."""
@@ -80,11 +83,35 @@ class RegimeClassifier:
             from catboost import CatBoostRegressor
             self._catboost_model = CatBoostRegressor()
             self._catboost_model.load_model(model_path)
+            trained_features = list(getattr(self._catboost_model, "feature_names_", []) or [])
+            expected_features = model_feature_names()
+            if trained_features and trained_features != expected_features:
+                self._catboost_model = None
+                self._use_model = False
+                self._model_prediction_ok = False
+                self._model_error = (
+                    "feature schema mismatch between trained model and live signals"
+                )
+                log.warning(
+                    "Refusing CatBoost model with incompatible features. "
+                    f"expected={expected_features}, got={trained_features}"
+                )
+                return
             self._use_model = True
+            self._model_prediction_ok = False
+            self._model_error = ""
             log.info("CatBoost model loaded — switching from rules to model")
         except Exception as e:
             log.warning(f"Failed to load model: {e}. Staying with rules.")
+            self._catboost_model = None
             self._use_model = False
+            self._model_prediction_ok = False
+            self._model_error = str(e)
+
+    def runtime_source(self) -> str:
+        if self._use_model and self._model_prediction_ok:
+            return "model"
+        return "rules"
 
     def classify(self, signals: dict) -> RegimeDecision:
         """
@@ -183,19 +210,12 @@ class RegimeClassifier:
 
     def _classify_model(self, s: dict) -> RegimeDecision:
         """CatBoost model-based classification."""
-        features = [
-            s.get("btc_momentum", 0),
-            s.get("btc_direction", 0),
-            s.get("btc_velocity", 0),
-            s.get("poly_spread", 0),
-            s.get("poly_orderbook_imbalance", 0),
-            s.get("poly_seconds_remaining", 0),
-            s.get("cross_platform_spread", 0),
-            s.get("short_momentum", 0),
-        ]
+        features = feature_vector_from_signals(s)
 
         try:
             prediction = self._catboost_model.predict([features])[0]
+            self._model_prediction_ok = True
+            self._model_error = ""
             lean_dir = max(-1.0, min(1.0, prediction))
             confidence = min(abs(lean_dir), 1.0)
 
@@ -222,6 +242,8 @@ class RegimeClassifier:
                 reason=f"CatBoost prediction: {lean_dir:.3f}"
             )
         except Exception as e:
+            self._model_prediction_ok = False
+            self._model_error = str(e)
             log.warning(f"Model prediction failed: {e}. Falling back to rules.")
             return self._classify_rules(s)
 
@@ -405,7 +427,7 @@ class PaperTrader:
         self._previous_mid: Optional[float] = None  # tracks mid between ticks
         self._settled_markets: set = set()  # markets already settled
 
-    def simulate_fills(self, current_mid: float):
+    def simulate_fills(self, current_mid: float, market_id: Optional[str] = None):
         """
         Check if EXISTING orders would have filled based on price movement
         BETWEEN the previous tick and this tick.
@@ -425,6 +447,11 @@ class PaperTrader:
 
         for order in self.open_orders:
             if order.filled:
+                remaining.append(order)
+                continue
+
+            # Only the active market's mid should be able to fill its own quotes.
+            if market_id and order.market_id != market_id:
                 remaining.append(order)
                 continue
 
@@ -494,6 +521,15 @@ class PaperTrader:
         if expired:
             log.debug(f"  Expired {expired} stale orders")
 
+    def _cancel_rotated_out_orders(self, active_market_id: str):
+        """Cancel quotes that belong to markets we are no longer pricing."""
+        if not active_market_id:
+            return
+        self.open_orders = [
+            order for order in self.open_orders
+            if order.filled or order.market_id == active_market_id
+        ]
+
     def has_active_quotes(self, market_id: str) -> bool:
         """Check if we already have active (unfilled) quotes for this market."""
         active = [o for o in self.open_orders if not o.filled and o.market_id == market_id]
@@ -510,6 +546,9 @@ class PaperTrader:
         mid = poly_signal.get("poly_mid_price")
         market_id = poly_signal.get("poly_market_id") or "paper_market"
         live_spread = poly_signal.get("poly_spread")
+
+        # Rotating markets should retire stale quotes before a new book becomes active.
+        self._cancel_rotated_out_orders(market_id)
 
         if mid is None:
             mid = 0.50

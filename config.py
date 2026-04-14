@@ -114,6 +114,7 @@ SETTLEMENT_LOSER_MAX_PRICE = 0.01
 MIN_SAMPLES_TO_TRAIN = 5000  # minimum rows before first training
 RETRAIN_INTERVAL_ROWS = 2000  # retrain every N new rows
 TRAIN_TEST_SPLIT = 0.8
+TRAIN_VALIDATION_GAP_SEC = 60  # keep 60s between train/test to avoid overlap
 CATBOOST_ITERATIONS = 500
 CATBOOST_DEPTH = 6
 CATBOOST_LEARNING_RATE = 0.05

@@ -201,7 +201,7 @@ async def get_training():
         })
 
     # Current classifier source
-    source = "model" if _bot_ref.classifier._use_model else "rules"
+    source = _bot_ref.classifier.runtime_source()
     model_exists = os.path.exists(config.MODEL_PATH)
 
     return {
@@ -212,6 +212,9 @@ async def get_training():
         "progress_pct": round(min(100, labeled / max(1, config.MIN_SAMPLES_TO_TRAIN) * 100), 1),
         "classifier_source": source,
         "model_exists": model_exists,
+        "model_loaded": _bot_ref.classifier._use_model,
+        "model_prediction_ok": _bot_ref.classifier._model_prediction_ok,
+        "model_error": _bot_ref.classifier._model_error,
         "training_runs": training_runs,
     }
 
