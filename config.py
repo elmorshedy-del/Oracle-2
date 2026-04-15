@@ -11,6 +11,15 @@ All parameters in one place. Tune these as you collect data.
 #    export ANTHROPIC_API_KEY="your_key_here"
 # ═══════════════════════════════════════════
 import os
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
@@ -119,6 +128,7 @@ SETTLEMENT_LOSER_MAX_PRICE = 0.01
 # ═══════════════════════════════════════════
 #  AUTO TUNER (CatBoost Training)
 # ═══════════════════════════════════════════
+AUTO_TRAINING_ENABLED = _env_flag("AUTO_TRAINING_ENABLED", False)
 MIN_SAMPLES_TO_TRAIN = 5000  # minimum rows before first training
 RETRAIN_INTERVAL_ROWS = 2000  # retrain every N new rows
 TRAIN_TEST_SPLIT = 0.8

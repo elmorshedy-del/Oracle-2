@@ -208,6 +208,7 @@ async def get_training():
         "total_ticks": total_ticks,
         "labeled_ticks": labeled,
         "unlabeled_ticks": unlabeled,
+        "auto_training_enabled": config.AUTO_TRAINING_ENABLED,
         "min_samples_needed": config.MIN_SAMPLES_TO_TRAIN,
         "progress_pct": round(min(100, labeled / max(1, config.MIN_SAMPLES_TO_TRAIN) * 100), 1),
         "classifier_source": source,

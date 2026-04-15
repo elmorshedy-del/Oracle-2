@@ -258,7 +258,7 @@ class PolymarketBot:
             log.error(f"DB log error: {e}")
 
         # ── Run tuner periodically ──
-        if now - self.last_tuning_time > self.tuning_interval:
+        if config.AUTO_TRAINING_ENABLED and now - self.last_tuning_time > self.tuning_interval:
             self.last_tuning_time = now
             try:
                 tuner_status = run_tuning_cycle(
