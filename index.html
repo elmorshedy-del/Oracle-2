@@ -203,7 +203,7 @@
   /* ── Stats Cards ── */
   .stats-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, 1fr);
     gap: 12px;
     margin-bottom: 16px;
   }
@@ -339,6 +339,28 @@
   .mode-dist-seg.m3 { background: var(--amber-dim); color: var(--amber); }
   .mode-dist-seg.m4 { background: var(--green-dim); color: var(--green); }
 
+  .mode-win-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .mode-win-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 10px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+  }
+  .mode-win-meta {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
   /* ── Explain Boxes ── */
   .explain {
     background: var(--bg2);
@@ -424,6 +446,13 @@
     <div class="panel-title" style="margin-top:20px">Mode Distribution</div>
     <div class="mode-dist" id="mode-dist"></div>
     <div id="mode-dist-labels" style="display:flex; gap:12px; font-size:11px; color:var(--text-dim)"></div>
+
+    <div class="panel-title" style="margin-top:20px">Mode Win Rate</div>
+    <div class="mode-win-list" id="mode-win-list">
+      <div class="mode-win-row">
+        <span style="color:var(--text-dim)">Waiting for settled markets...</span>
+      </div>
+    </div>
   </div>
 
   <!-- CENTER: Charts + Stats -->
@@ -444,6 +473,14 @@
       <div class="stat-card">
         <div class="stat-label">Fill Rate</div>
         <div class="stat-value" id="stat-fill-rate">0%</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Settled Win Rate</div>
+        <div class="stat-value" id="stat-win-rate">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Best Mode</div>
+        <div class="stat-value" id="stat-best-mode">—</div>
       </div>
     </div>
 
@@ -471,6 +508,10 @@
         <span style="font-size:12px; color:var(--text-dim)">Classifier</span>
         <span class="mono" style="font-size:13px; font-weight:600" id="classifier-source">RULES</span>
       </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px">
+        <span style="font-size:12px; color:var(--text-dim)">Auto Training</span>
+        <span class="mono" style="font-size:13px; font-weight:600" id="auto-training-status">OFF</span>
+      </div>
       <div class="progress-label">
         <span id="train-samples">0 samples</span>
         <span id="train-target">/ 5,000 needed</span>
@@ -485,8 +526,8 @@
     <div class="explain" style="margin-top:12px">
       <strong>Auto-tuning:</strong> Every tick is logged with all signal values.
       After 60 seconds, the system records what BTC actually did, creating labeled training data.
-      At 5,000 samples, CatBoost trains automatically.
-      If it beats 55% directional accuracy, it replaces the deterministic rules.
+      Training is manual unless auto-training is explicitly turned back on.
+      If CatBoost beats 55% directional accuracy, it can replace the deterministic rules.
     </div>
 
     <div class="panel-title" style="margin-top:20px">Training Runs</div>
@@ -589,6 +630,8 @@ const modeChart = new Chart(document.getElementById('chart-mode'), {
 
 // ═══ Data Fetching ═══
 const API = '';  // same origin
+const WIN_RATE_REFRESH_MS = 15000;
+let lastWinRatesFetch = 0;
 
 async function fetchStatus() {
   try {
@@ -652,7 +695,6 @@ async function fetchStatus() {
     dpnlEl.textContent = (dpnl >= 0 ? '+$' : '-$') + Math.abs(dpnl).toFixed(2);
     dpnlEl.className = 'stat-value ' + (dpnl >= 0 ? 'positive' : 'negative');
     document.getElementById('stat-fill-rate').textContent = ((d.trader.fill_rate || 0) * 100).toFixed(0) + '%';
-
     // System
     document.getElementById('sys-ticks').textContent = (d.tick_count || 0).toLocaleString();
     document.getElementById('sys-orders').textContent = d.trader.open_orders || 0;
@@ -663,6 +705,52 @@ async function fetchStatus() {
     haltedEl.style.color = d.risk.halted ? 'var(--red)' : 'var(--green)';
 
   } catch(e) { console.debug('Status fetch error:', e); }
+}
+
+async function fetchWinRates(force = false) {
+  const now = Date.now();
+  if (!force && now - lastWinRatesFetch < WIN_RATE_REFRESH_MS) return;
+
+  try {
+    const res = await fetch(API + '/api/win_rates');
+    const d = await res.json();
+    if (d.error) return;
+    lastWinRatesFetch = now;
+
+    const overall = d.overall || {};
+    const bestMode = d.best_mode || null;
+    const overallWinRate = overall.win_rate;
+    document.getElementById('stat-win-rate').textContent =
+      overallWinRate == null ? '—' : (overallWinRate * 100).toFixed(1) + '%';
+    document.getElementById('stat-best-mode').textContent =
+      bestMode ? `${bestMode.label} ${(bestMode.win_rate * 100).toFixed(0)}%` : '—';
+
+    const modeWinList = document.getElementById('mode-win-list');
+    const modeRows = (d.by_mode || []).filter(m => m.settled_count > 0);
+    if (modeRows.length) {
+      modeWinList.innerHTML = modeRows.map(m => `
+        <div class="mode-win-row">
+          <div>
+            <span class="mode-badge m${m.mode}">${m.label}</span>
+            <div class="mode-win-meta">${m.wins}W / ${m.losses}L / ${m.pushes}P</div>
+          </div>
+          <div style="text-align:right">
+            <div class="mono" style="color:${m.win_rate == null ? 'var(--text-dim)' : m.win_rate >= 0.5 ? 'var(--green)' : 'var(--red)'}">
+              ${m.win_rate == null ? '—' : (m.win_rate * 100).toFixed(1) + '%'}
+            </div>
+            <div class="mode-win-meta">${m.settled_count} settled</div>
+          </div>
+        </div>
+      `).join('');
+    } else {
+      modeWinList.innerHTML = `
+        <div class="mode-win-row">
+          <span style="color:var(--text-dim)">Waiting for settled markets...</span>
+        </div>
+      `;
+    }
+
+  } catch(e) { console.debug('Win rate fetch error:', e); }
 }
 
 async function fetchTicks() {
@@ -724,14 +812,23 @@ async function fetchTraining() {
     const src = document.getElementById('classifier-source');
     src.textContent = d.classifier_source === 'model' ? 'CATBOOST' : 'RULES';
     src.style.color = d.classifier_source === 'model' ? 'var(--green)' : 'var(--amber)';
+    const autoTrainEl = document.getElementById('auto-training-status');
+    autoTrainEl.textContent = d.auto_training_enabled ? 'ON' : 'OFF';
+    autoTrainEl.style.color = d.auto_training_enabled ? 'var(--green)' : 'var(--amber)';
 
     document.getElementById('train-samples').textContent = (d.labeled_ticks || 0).toLocaleString() + ' samples';
-    document.getElementById('train-target').textContent = '/ ' + (d.min_samples_needed || 5000).toLocaleString() + ' needed';
+    document.getElementById('train-target').textContent = d.auto_training_enabled
+      ? '/ ' + (d.min_samples_needed || 5000).toLocaleString() + ' needed'
+      : '/ manual trigger only';
     document.getElementById('train-progress').style.width = (d.progress_pct || 0) + '%';
-    document.getElementById('train-pct').textContent = (d.progress_pct || 0).toFixed(0) + '%';
+    document.getElementById('train-pct').textContent = d.auto_training_enabled
+      ? (d.progress_pct || 0).toFixed(0) + '%'
+      : 'paused';
 
     // ETA
-    if (d.total_ticks > 10 && d.labeled_ticks < d.min_samples_needed) {
+    if (!d.auto_training_enabled) {
+      document.getElementById('train-eta').textContent = 'CPU saver active';
+    } else if (d.total_ticks > 10 && d.labeled_ticks < d.min_samples_needed) {
       const remaining = d.min_samples_needed - d.labeled_ticks;
       const etaMin = Math.ceil(remaining * 2 / 60);  // ~2 sec per tick
       document.getElementById('train-eta').textContent = '~' + etaMin + ' min to train';
@@ -786,9 +883,10 @@ async function fetchModeDist() {
 
 // ═══ Polling Loop ═══
 async function poll() {
-  await Promise.all([fetchStatus(), fetchTicks(), fetchTrades(), fetchTraining(), fetchModeDist()]);
+  await Promise.all([fetchStatus(), fetchTicks(), fetchTrades(), fetchTraining(), fetchModeDist(), fetchWinRates()]);
 }
 
+fetchWinRates(true);
 poll();
 setInterval(poll, 3000);  // refresh every 3 seconds
 </script>

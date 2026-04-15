@@ -244,3 +244,11 @@ async def get_mode_distribution():
         ],
         "total": total,
     }
+
+
+@app.get("/api/win_rates")
+async def get_win_rates():
+    """Settled win rates overall and by mode."""
+    if not _bot_ref:
+        return {"error": "Bot not started"}
+    return database.get_win_rate_summary(_bot_ref.db)
