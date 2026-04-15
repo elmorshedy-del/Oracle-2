@@ -291,9 +291,7 @@ class RiskManager:
             size = adjusted
 
         # Total exposure check
-        total_exposure = sum(
-            p.total_cost for p in self.positions.values()
-        )
+        total_exposure = self.total_exposure()
         order_cost = size * price
         if total_exposure + order_cost > config.MAX_TOTAL_EXPOSURE:
             max_allowed = config.MAX_TOTAL_EXPOSURE - total_exposure
@@ -302,6 +300,10 @@ class RiskManager:
             size = max_allowed / price
 
         return True, size, "OK"
+
+    def total_exposure(self) -> float:
+        """Current dollars tied up in unresolved positions."""
+        return sum(position.total_cost for position in self.positions.values())
 
     def update_position(self, market_id: str, side: str, shares: float,
                         price: float, is_buy: bool):
@@ -385,6 +387,33 @@ class RiskManager:
             "realized_pnl": round(realized_pnl, 4),
         }
 
+    def release_position_at_cost(self, market_id: str):
+        """
+        Flatten a non-settleable synthetic position at its own cost basis.
+
+        This is only used to unwind fallback paper exposure that should never
+        have consumed real settlement inventory in the first place.
+        """
+        pos = self.positions.get(market_id)
+        if not pos:
+            return None
+
+        refunded_cost = pos.total_cost
+        self.balance += refunded_cost
+        self.peak_balance = max(self.peak_balance, self.balance)
+
+        result = {
+            "market_id": market_id,
+            "num_yes_shares": round(pos.yes_shares, 4),
+            "num_no_shares": round(pos.no_shares, 4),
+            "payout_yes": 0.0,
+            "payout_no": 0.0,
+            "payout": round(refunded_cost, 4),
+            "realized_pnl": 0.0,
+        }
+        del self.positions[market_id]
+        return result
+
     def reset_daily(self):
         """Reset daily tracking at start of new day."""
         self.daily_starting_balance = self.balance
@@ -392,6 +421,7 @@ class RiskManager:
         self.halt_reason = ""
 
     def get_stats(self) -> dict:
+        total_exposure = self.total_exposure()
         return {
             "balance": round(self.balance, 2),
             "total_pnl": round(self.balance - self.starting_capital, 2),
@@ -399,6 +429,11 @@ class RiskManager:
             "peak_balance": round(self.peak_balance, 2),
             "num_positions": len(self.positions),
             "halted": self.halted,
+            "halt_reason": self.halt_reason,
+            "total_exposure": round(total_exposure, 2),
+            "available_exposure": round(
+                max(0.0, config.MAX_TOTAL_EXPOSURE - total_exposure), 2
+            ),
         }
 
 
@@ -545,7 +580,11 @@ class PaperTrader:
         """
         mid = poly_signal.get("poly_mid_price")
         market_id = poly_signal.get("poly_market_id") or "paper_market"
+        mid_source = poly_signal.get("mid_source")
         live_spread = poly_signal.get("poly_spread")
+
+        if mid_source != "polymarket" or not poly_signal.get("poly_market_id"):
+            return []
 
         # Rotating markets should retire stale quotes before a new book becomes active.
         self._cancel_rotated_out_orders(market_id)
@@ -728,6 +767,11 @@ class PaperTrader:
             )
 
         return pnl
+
+    def record_settlement(self, market_id: str):
+        """Track a market as settled in trader stats and retire any remaining quotes."""
+        self.cancel_all(market_id=market_id)
+        self._settled_markets.add(market_id)
 
     def cancel_all(self, market_id=None, side=None):
         """Cancel open orders, optionally filtered by market/side."""

@@ -146,13 +146,13 @@ class PolymarketBot:
         # a real chance to fill based on price movement since last tick
         pre_sig1 = self.binance.get_signal()
         pre_sig2 = self.polymarket.get_signal()
-        fill_mid, _ = self._resolve_mid(pre_sig1, pre_sig2, now)
-        if fill_mid is not None:
+        fill_market_id = pre_sig2.get("poly_market_id")
+        fill_mid = pre_sig2.get("poly_mid_price")
+        if fill_mid is not None and fill_market_id:
             self._last_mid = fill_mid
-        fills = self.trader.simulate_fills(
-            fill_mid if fill_mid is not None else self._last_mid,
-            market_id=pre_sig2.get("poly_market_id"),
-        )
+            fills = self.trader.simulate_fills(fill_mid, market_id=fill_market_id)
+        else:
+            fills = []
 
         # Log fills to database
         for fill in fills:
@@ -198,8 +198,6 @@ class PolymarketBot:
             sig2["poly_mid_price"] = resolved_mid
             self._last_mid = resolved_mid
         sig2["mid_source"] = mid_source
-        if mid_source == "btc_synthetic" and not sig2.get("poly_market_id"):
-            sig2["poly_market_id"] = "btc_synthetic"
 
         sig3 = self.kalshi.get_signal(poly_mid=sig2.get("poly_mid_price"))
 
@@ -219,6 +217,7 @@ class PolymarketBot:
 
         # ── Step 4: Replenish quotes only if needed ──
         orders = []
+        self._cleanup_synthetic_position()
         if not self.risk.halted:
             orders = self.trader.generate_orders(decision, sig2)
 
@@ -283,53 +282,66 @@ class PolymarketBot:
         if not self.polymarket._session:
             return None
 
-        params = None
+        lookup_params = []
+        if market.get("id"):
+            lookup_params.append({"condition_id": market["id"]})
         if market.get("gamma_market_id"):
-            params = {"id": market["gamma_market_id"]}
-        elif market.get("slug"):
-            params = {"slug": market["slug"]}
-        else:
-            return None
+            lookup_params.append({"id": market["gamma_market_id"]})
+        if market.get("slug"):
+            lookup_params.append({"slug": market["slug"]})
 
-        try:
-            async with self.polymarket._session.get(
-                f"{config.GAMMA_API_URL}/markets",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                rows = await resp.json()
-        except Exception as e:
-            log.debug(f"Settlement lookup failed for {market.get('slug')}: {e}")
-            return None
+        for params in lookup_params:
+            try:
+                async with self.polymarket._session.get(
+                    f"{config.GAMMA_API_URL}/markets",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    rows = await resp.json()
+            except Exception as e:
+                log.debug(f"Settlement lookup failed for {market.get('slug')}: {e}")
+                continue
 
+            winner = self._winner_from_gamma_rows(rows)
+            if winner:
+                return winner
+        return None
+
+    def _winner_from_gamma_rows(self, rows):
         if not rows:
             return None
 
-        resolved = rows[0]
-        outcome_prices = resolved.get("outcomePrices", [])
-        outcomes = resolved.get("outcomes", [])
-        prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
-        names = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        for resolved in rows:
+            explicit_outcome = str(resolved.get("outcome") or "").strip().lower()
+            if explicit_outcome in {"yes", "up"}:
+                return "YES"
+            if explicit_outcome in {"no", "down"}:
+                return "NO"
 
-        if not prices or not names:
-            return None
+            outcome_prices = resolved.get("outcomePrices", [])
+            outcomes = resolved.get("outcomes", [])
+            prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
+            names = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
 
-        try:
-            numeric_prices = [float(price) for price in prices]
-        except Exception:
-            return None
+            if not prices or not names:
+                continue
 
-        winner_idx = max(range(len(numeric_prices)), key=lambda idx: numeric_prices[idx])
-        if numeric_prices[winner_idx] < 0.999:
-            return None
+            try:
+                numeric_prices = [float(price) for price in prices]
+            except Exception:
+                continue
 
-        label = str(names[winner_idx]).strip().lower()
-        if label in {"yes", "up"}:
-            return "YES"
-        if label in {"no", "down"}:
-            return "NO"
+            winner_idx = max(range(len(numeric_prices)), key=lambda idx: numeric_prices[idx])
+            if numeric_prices[winner_idx] < config.SETTLEMENT_WINNER_MIN_PRICE:
+                continue
+
+            label = str(names[winner_idx]).strip().lower()
+            if label in {"yes", "up"}:
+                return "YES"
+            if label in {"no", "down"}:
+                return "NO"
         return None
 
     def _resolve_mid(self, sig1: dict, sig2: dict, now: float):
@@ -357,6 +369,36 @@ class PolymarketBot:
         if poly_mid is not None:
             return poly_mid, "polymarket"
         return self._last_mid, "btc_synthetic"
+
+    def _cleanup_synthetic_position(self):
+        """Release synthetic fallback exposure so it cannot freeze the bot."""
+        if config.SYNTHETIC_MARKET_ID not in self.risk.positions:
+            return
+
+        result = self.risk.release_position_at_cost(config.SYNTHETIC_MARKET_ID)
+        if not result:
+            return
+
+        self.trader.record_settlement(config.SYNTHETIC_MARKET_ID)
+        try:
+            database.record_market_settlement(self.db, {
+                "market_id": config.SYNTHETIC_MARKET_ID,
+                "settled_at": time.time(),
+                "winning_side": "FLAT",
+                "payout_yes": 0.0,
+                "payout_no": 0.0,
+                "num_yes_shares": result["num_yes_shares"],
+                "num_no_shares": result["num_no_shares"],
+                "realized_pnl": 0.0,
+                "source": "synthetic-flat-unwind",
+            })
+        except Exception as e:
+            log.debug(f"Failed to record synthetic unwind: {e}")
+
+        log.warning(
+            "Released synthetic fallback position at cost to free exposure: "
+            f"refund=${result['payout']:.2f}"
+        )
 
     def _compute_feature_block(self, sig1: dict):
         """Build volatility, structure, momentum, and time features."""
@@ -528,7 +570,7 @@ class PolymarketBot:
             if not result:
                 continue
 
-            self.trader.cancel_all(market_id=market_id)
+            self.trader.record_settlement(market_id)
             database.record_market_settlement(self.db, {
                 "market_id": market_id,
                 "settled_at": time.time(),
