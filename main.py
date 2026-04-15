@@ -322,13 +322,13 @@ class PolymarketBot:
 
             outcome_prices = resolved.get("outcomePrices", [])
             outcomes = resolved.get("outcomes", [])
-            prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
-            names = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
-
-            if not prices or not names:
-                continue
-
             try:
+                prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
+                names = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+                if not isinstance(prices, list) or not isinstance(names, list):
+                    continue
+                if not prices or not names or len(prices) != len(names):
+                    continue
                 numeric_prices = [float(price) for price in prices]
             except Exception:
                 continue
