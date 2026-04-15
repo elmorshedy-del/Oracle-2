@@ -12,21 +12,59 @@ import config
 from model_features import model_feature_names
 
 
-TICK_COLUMN_DEFINITIONS = {
-    "btc_volatility_15": "REAL DEFAULT 0",
-    "btc_volatility_60": "REAL DEFAULT 0",
-    "btc_vol_ratio": "REAL DEFAULT 1.0",
-    "dist_from_high": "REAL DEFAULT 0",
-    "dist_from_low": "REAL DEFAULT 0",
-    "momentum_5s": "REAL DEFAULT 0",
-    "momentum_30s": "REAL DEFAULT 0",
-    "momentum_divergence": "INTEGER DEFAULT 0",
-    "hour_of_day": "REAL DEFAULT 0",
-    "day_of_week": "INTEGER DEFAULT 0",
-    "is_us_market_hours": "INTEGER DEFAULT 0",
-    "btc_funding_rate": "REAL DEFAULT 0",
-    "mid_source": "TEXT DEFAULT 'polymarket'",
+TICK_COLUMNS = [
+    ("timestamp", "REAL NOT NULL"),
+    ("btc_price", "REAL"),
+    ("btc_momentum", "REAL"),
+    ("btc_direction", "INTEGER"),
+    ("btc_velocity", "REAL"),
+    ("poly_market_id", "TEXT"),
+    ("poly_yes_best_bid", "REAL"),
+    ("poly_yes_best_ask", "REAL"),
+    ("poly_no_best_bid", "REAL"),
+    ("poly_no_best_ask", "REAL"),
+    ("poly_mid_price", "REAL"),
+    ("poly_spread", "REAL"),
+    ("poly_orderbook_imbalance", "REAL"),
+    ("poly_volume_24h", "REAL"),
+    ("poly_seconds_remaining", "REAL"),
+    ("btc_volatility_15", "REAL DEFAULT 0"),
+    ("btc_volatility_60", "REAL DEFAULT 0"),
+    ("btc_vol_ratio", "REAL DEFAULT 1.0"),
+    ("dist_from_high", "REAL DEFAULT 0"),
+    ("dist_from_low", "REAL DEFAULT 0"),
+    ("momentum_5s", "REAL DEFAULT 0"),
+    ("momentum_30s", "REAL DEFAULT 0"),
+    ("momentum_divergence", "INTEGER DEFAULT 0"),
+    ("hour_of_day", "REAL DEFAULT 0"),
+    ("day_of_week", "INTEGER DEFAULT 0"),
+    ("is_us_market_hours", "INTEGER DEFAULT 0"),
+    ("btc_funding_rate", "REAL DEFAULT 0"),
+    ("mid_source", "TEXT DEFAULT 'polymarket'"),
+    ("kalshi_yes_price", "REAL"),
+    ("kalshi_no_price", "REAL"),
+    ("cross_platform_spread", "REAL"),
+    ("mode", "INTEGER"),
+    ("lean_direction", "REAL"),
+    ("lean_confidence", "REAL"),
+    ("classifier_source", "TEXT"),
+    ("btc_price_after_30s", "REAL"),
+    ("btc_price_after_60s", "REAL"),
+    ("btc_price_after_300s", "REAL"),
+    ("optimal_lean", "REAL"),
+]
+
+TICK_COLUMN_DEFINITIONS = dict(TICK_COLUMNS)
+TICK_BACKFILL_COLUMNS = {
+    "btc_price_after_30s",
+    "btc_price_after_60s",
+    "btc_price_after_300s",
+    "optimal_lean",
 }
+TICK_LOG_COLUMNS = [
+    name for name, _ in TICK_COLUMNS
+    if name not in TICK_BACKFILL_COLUMNS
+]
 
 
 def ensure_tick_columns(conn):
@@ -49,56 +87,17 @@ def init_db(path=None):
     conn = sqlite3.connect(path)
     c = conn.cursor()
 
+    tick_columns_sql = ",\n            ".join(
+        f"{name} {definition}" for name, definition in TICK_COLUMNS
+    )
+
     # ── Main tick log: every signal reading + decision ──
     c.execute("""
         CREATE TABLE IF NOT EXISTS ticks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            -- Signal 1: Binance
-            btc_price REAL,
-            btc_momentum REAL,
-            btc_direction INTEGER,  -- -1, 0, +1
-            btc_velocity REAL,      -- rate of change
-            -- Polymarket orderbook
-            poly_market_id TEXT,
-            poly_yes_best_bid REAL,
-            poly_yes_best_ask REAL,
-            poly_no_best_bid REAL,
-            poly_no_best_ask REAL,
-            poly_mid_price REAL,
-            poly_spread REAL,
-            poly_orderbook_imbalance REAL,  -- -1 to +1
-            poly_volume_24h REAL,
-            poly_seconds_remaining REAL,
-            btc_volatility_15 REAL DEFAULT 0,
-            btc_volatility_60 REAL DEFAULT 0,
-            btc_vol_ratio REAL DEFAULT 1.0,
-            dist_from_high REAL DEFAULT 0,
-            dist_from_low REAL DEFAULT 0,
-            momentum_5s REAL DEFAULT 0,
-            momentum_30s REAL DEFAULT 0,
-            momentum_divergence INTEGER DEFAULT 0,
-            hour_of_day REAL DEFAULT 0,
-            day_of_week INTEGER DEFAULT 0,
-            is_us_market_hours INTEGER DEFAULT 0,
-            btc_funding_rate REAL DEFAULT 0,
-            mid_source TEXT DEFAULT 'polymarket',
-            -- Signal 3: Cross-platform
-            kalshi_yes_price REAL,
-            kalshi_no_price REAL,
-            cross_platform_spread REAL,
-            -- Regime classifier output
-            mode INTEGER,  -- 1, 2, 3, 4
-            lean_direction REAL,  -- -1.0 to +1.0
-            lean_confidence REAL, -- 0.0 to 1.0
-            classifier_source TEXT,  -- 'rules' or 'model'
-            -- For training: what actually happened next
-            btc_price_after_30s REAL,
-            btc_price_after_60s REAL,
-            btc_price_after_300s REAL,
-            optimal_lean REAL  -- computed retroactively by tuner
+            {tick_columns_sql}
         )
-    """)
+    """.format(tick_columns_sql=tick_columns_sql))
 
     # ── Paper trade log ──
     c.execute("""
@@ -173,22 +172,9 @@ def init_db(path=None):
 
 def log_tick(conn, data: dict):
     """Insert one tick row. Pass a dict with column names as keys."""
-    columns = [
-        "timestamp", "btc_price", "btc_momentum", "btc_direction",
-        "btc_velocity", "poly_market_id", "poly_yes_best_bid",
-        "poly_yes_best_ask", "poly_no_best_bid", "poly_no_best_ask",
-        "poly_mid_price", "poly_spread", "poly_orderbook_imbalance",
-        "poly_volume_24h", "poly_seconds_remaining",
-        "btc_volatility_15", "btc_volatility_60", "btc_vol_ratio",
-        "dist_from_high", "dist_from_low", "momentum_5s", "momentum_30s",
-        "momentum_divergence", "hour_of_day", "day_of_week",
-        "is_us_market_hours", "btc_funding_rate", "mid_source",
-        "kalshi_yes_price", "kalshi_no_price", "cross_platform_spread",
-        "mode", "lean_direction", "lean_confidence", "classifier_source"
-    ]
-    values = [data.get(c) for c in columns]
-    placeholders = ",".join(["?"] * len(columns))
-    col_str = ",".join(columns)
+    values = [data.get(column) for column in TICK_LOG_COLUMNS]
+    placeholders = ",".join(["?"] * len(TICK_LOG_COLUMNS))
+    col_str = ",".join(TICK_LOG_COLUMNS)
     conn.execute(f"INSERT INTO ticks ({col_str}) VALUES ({placeholders})", values)
     conn.commit()
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]

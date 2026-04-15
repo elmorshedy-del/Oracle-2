@@ -592,8 +592,6 @@ class PolymarketFeed:
         preferred_market_id = market_id or self.selected_market_id
         if preferred_market_id and preferred_market_id in self.orderbooks:
             book_data = self.orderbooks[preferred_market_id]
-        elif market_id and market_id in self.orderbooks:
-            book_data = self.orderbooks[market_id]
         elif self.orderbooks:
             book_data = max(self.orderbooks.values(), key=lambda x: x["timestamp"])
         else:
