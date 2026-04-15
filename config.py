@@ -102,6 +102,7 @@ MAKER_REBATE_BPS = 10  # ~0.1% maker rebate (estimate)
 TAKER_FEE_MAX_BPS = 156  # 1.56% max taker fee at 50% probability
 ORDER_MAX_AGE_SEC = 30  # orders expire after this many seconds
 MIN_TRADABLE_SPREAD = 0.20  # skip markets with spread > 20¢ (untradable book)
+SYNTHETIC_MARKET_ID = "btc_synthetic"
 SYNTHETIC_MID_SENSITIVITY = 10.0  # 0.1% BTC move ≈ 1¢ contract move
 SYNTHETIC_MID_MIN = 0.10
 SYNTHETIC_MID_MAX = 0.90
