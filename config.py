@@ -24,24 +24,27 @@ LOG_DB_PATH = "data/trades.db"
 MODEL_PATH = "data/catboost_model.cbm"
 
 # ═══════════════════════════════════════════
-#  BINANCE FEED (Signal 1: Market Data)
+#  BTC FEED (Signal 1: Market Data)
 # ═══════════════════════════════════════════
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+BTC_PRICE_POLL_INTERVAL_SEC = 1
 BINANCE_MOMENTUM_WINDOW = 15  # seconds of price history for momentum calc
 BINANCE_DIRECTION_THRESHOLD = 0.0015  # 0.15% move = directional signal
+BINANCE_FUNDING_POLL_INTERVAL_SEC = 60
 
 # ═══════════════════════════════════════════
 #  POLYMARKET FEED (Orderbook Data)
 # ═══════════════════════════════════════════
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_API_URL = "https://clob.polymarket.com"
+POLYMARKET_EVENT_LOOKAHEAD_SEC = 30 * 60
+POLYMARKET_CLOB_MARKET_LIMIT = 200
 MARKET_SLUGS = [
     "will-bitcoin-go-up-or-down-in-the-next-5-minutes",
     "will-bitcoin-go-up-or-down-in-the-next-15-minutes",
 ]
 # Fallback: search by tag
 MARKET_TAGS = ["btc", "bitcoin"]
-MARKET_REFRESH_INTERVAL = 30  # seconds between checking for new markets (short-term rotate fast)
+MARKET_REFRESH_INTERVAL = 15  # seconds between checking for new markets (short-term rotate fast)
 
 # ═══════════════════════════════════════════
 #  NEWS / LLM SIGNAL (Signal 2: Event Detection)
@@ -99,6 +102,10 @@ MAKER_REBATE_BPS = 10  # ~0.1% maker rebate (estimate)
 TAKER_FEE_MAX_BPS = 156  # 1.56% max taker fee at 50% probability
 ORDER_MAX_AGE_SEC = 30  # orders expire after this many seconds
 MIN_TRADABLE_SPREAD = 0.20  # skip markets with spread > 20¢ (untradable book)
+SYNTHETIC_MID_SENSITIVITY = 10.0  # 0.1% BTC move ≈ 1¢ contract move
+SYNTHETIC_MID_MIN = 0.10
+SYNTHETIC_MID_MAX = 0.90
+SYNTHETIC_REFERENCE_RESET_SEC = 300
 
 # ═══════════════════════════════════════════
 #  SETTLEMENT (Market Resolution)

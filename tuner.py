@@ -20,6 +20,7 @@ import numpy as np
 
 import config
 import database
+from model_features import model_feature_names
 
 log = logging.getLogger("tuner")
 
@@ -118,7 +119,7 @@ def should_train(conn) -> bool:
 
 
 def _split_chronologically(timestamps, X, y):
-    """Split sequential data without letting adjacent future windows overlap."""
+    """Split sequential data without leakage from overlapping windows."""
     split_idx = int(len(timestamps) * config.TRAIN_TEST_SPLIT)
     split_idx = min(max(split_idx, 1), len(timestamps) - 1)
     split_time = timestamps[split_idx]
@@ -152,7 +153,6 @@ def _split_chronologically(timestamps, X, y):
         "gap_seconds": gap_seconds,
     }
 
-
 def train_model(conn, model_path=None, min_accuracy=None, log_run=True, train_dir=None) -> dict:
     """
     Train CatBoost on collected data.
@@ -179,9 +179,14 @@ def train_model(conn, model_path=None, min_accuracy=None, log_run=True, train_di
     # Handle NaN/None → fill with 0
     data = np.nan_to_num(data, nan=0.0)
 
-    # The first column is timestamp; the last is the target.
+    # First column is timestamp; last column is target.
     timestamps = data[:, 0]
     feature_names = columns[1:-1]
+    expected_feature_names = model_feature_names()
+    if feature_names != expected_feature_names:
+        raise ValueError(
+            f"Training schema mismatch. expected={expected_feature_names}, got={feature_names}"
+        )
     X = data[:, 1:-1]
     y = data[:, -1]
 
@@ -190,7 +195,6 @@ def train_model(conn, model_path=None, min_accuracy=None, log_run=True, train_di
     X_test = split["X_test"]
     y_train = split["y_train"]
     y_test = split["y_test"]
-
     train_dir = train_dir or os.path.join(
         os.path.dirname(model_path) or ".",
         "catboost_info",

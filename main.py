@@ -13,13 +13,17 @@ Run: python main.py
 """
 
 import asyncio
+import json
 import time
 import os
 import sys
 import signal
 import logging
+from statistics import stdev
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
+
+import aiohttp
 
 # Load .env file if present
 try:
@@ -79,6 +83,8 @@ class PolymarketBot:
         self.settlement_interval = config.SETTLEMENT_CHECK_INTERVAL_SEC
         self.last_day = None
         self._last_mid = 0.50  # previous tick's mid price (for fill simulation)
+        self._btc_reference_price = None
+        self._btc_reference_time = None
 
         # Load model if exists
         if config.USE_MODEL_IF_AVAILABLE and os.path.exists(config.MODEL_PATH):
@@ -138,15 +144,14 @@ class PolymarketBot:
         # ── Step 1: Simulate fills on EXISTING orders ──
         # This runs BEFORE placing new orders so old quotes get
         # a real chance to fill based on price movement since last tick
-        mid = self._last_mid  # mid from previous tick
-        sig2 = self.polymarket.get_signal()
-        new_mid = sig2.get("poly_mid_price")
-        if new_mid is not None:
-            self._last_mid = new_mid
-
+        pre_sig1 = self.binance.get_signal()
+        pre_sig2 = self.polymarket.get_signal()
+        fill_mid, _ = self._resolve_mid(pre_sig1, pre_sig2, now)
+        if fill_mid is not None:
+            self._last_mid = fill_mid
         fills = self.trader.simulate_fills(
-            new_mid if new_mid is not None else mid,
-            market_id=sig2.get("poly_market_id"),
+            fill_mid if fill_mid is not None else self._last_mid,
+            market_id=pre_sig2.get("poly_market_id"),
         )
 
         # Log fills to database
@@ -188,6 +193,14 @@ class PolymarketBot:
             self.price_history.append((now, sig1["btc_price"]))
 
         sig2 = self.polymarket.get_signal()  # refresh after update
+        resolved_mid, mid_source = self._resolve_mid(sig1, sig2, now)
+        if resolved_mid is not None:
+            sig2["poly_mid_price"] = resolved_mid
+            self._last_mid = resolved_mid
+        sig2["mid_source"] = mid_source
+        if mid_source == "btc_synthetic" and not sig2.get("poly_market_id"):
+            sig2["poly_market_id"] = "btc_synthetic"
+
         sig3 = self.kalshi.get_signal(poly_mid=sig2.get("poly_mid_price"))
 
         try:
@@ -200,6 +213,7 @@ class PolymarketBot:
             **sig1, **sig2, **sig3, **sig4,
             "short_momentum": short_momentum,
         }
+        combined.update(self._compute_feature_block(sig1))
 
         decision = self.classifier.classify(combined)
 
@@ -264,6 +278,156 @@ class PolymarketBot:
             self.last_status_time = now
             self._print_status(decision, sig1, fills)
 
+    async def _fetch_confirmed_winner(self, market: dict):
+        """Use the Gamma market API to confirm the resolved winner."""
+        if not self.polymarket._session:
+            return None
+
+        params = None
+        if market.get("gamma_market_id"):
+            params = {"id": market["gamma_market_id"]}
+        elif market.get("slug"):
+            params = {"slug": market["slug"]}
+        else:
+            return None
+
+        try:
+            async with self.polymarket._session.get(
+                f"{config.GAMMA_API_URL}/markets",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                rows = await resp.json()
+        except Exception as e:
+            log.debug(f"Settlement lookup failed for {market.get('slug')}: {e}")
+            return None
+
+        if not rows:
+            return None
+
+        resolved = rows[0]
+        outcome_prices = resolved.get("outcomePrices", [])
+        outcomes = resolved.get("outcomes", [])
+        prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
+        names = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+
+        if not prices or not names:
+            return None
+
+        try:
+            numeric_prices = [float(price) for price in prices]
+        except Exception:
+            return None
+
+        winner_idx = max(range(len(numeric_prices)), key=lambda idx: numeric_prices[idx])
+        if numeric_prices[winner_idx] < 0.999:
+            return None
+
+        label = str(names[winner_idx]).strip().lower()
+        if label in {"yes", "up"}:
+            return "YES"
+        if label in {"no", "down"}:
+            return "NO"
+        return None
+
+    def _resolve_mid(self, sig1: dict, sig2: dict, now: float):
+        """Use a real Polymarket mid when tradable, otherwise fall back to BTC."""
+        poly_mid = sig2.get("poly_mid_price")
+        poly_spread = sig2.get("poly_spread")
+        if poly_mid is not None and (poly_spread is None or poly_spread <= config.MIN_TRADABLE_SPREAD):
+            return poly_mid, "polymarket"
+
+        btc_price = sig1.get("btc_price")
+        if btc_price:
+            if (
+                self._btc_reference_price is None
+                or self._btc_reference_time is None
+                or now - self._btc_reference_time > config.SYNTHETIC_REFERENCE_RESET_SEC
+            ):
+                self._btc_reference_price = btc_price
+                self._btc_reference_time = now
+
+            btc_change = (btc_price - self._btc_reference_price) / self._btc_reference_price
+            synthetic_mid = 0.50 + (btc_change * config.SYNTHETIC_MID_SENSITIVITY)
+            synthetic_mid = max(config.SYNTHETIC_MID_MIN, min(config.SYNTHETIC_MID_MAX, synthetic_mid))
+            return round(synthetic_mid, 4), "btc_synthetic"
+
+        if poly_mid is not None:
+            return poly_mid, "polymarket"
+        return self._last_mid, "btc_synthetic"
+
+    def _compute_feature_block(self, sig1: dict):
+        """Build volatility, structure, momentum, and time features."""
+        history = list(self.binance.history)
+        btc_price = sig1.get("btc_price")
+
+        prices_15 = [price for _, price in history[-15:]]
+        prices_60 = [price for _, price in history[-60:]]
+        prices_300 = [price for _, price in history[-300:]]
+
+        btc_volatility_15 = self._volatility_from_prices(prices_15, minimum_points=5)
+        btc_volatility_60 = self._volatility_from_prices(prices_60, minimum_points=10)
+        btc_vol_ratio = (
+            btc_volatility_15 / btc_volatility_60
+            if btc_volatility_60 > 0
+            else 1.0
+        )
+
+        if prices_300 and btc_price:
+            session_high = max(prices_300)
+            session_low = min(prices_300)
+            dist_from_high = (session_high - btc_price) / btc_price
+            dist_from_low = (btc_price - session_low) / btc_price
+        else:
+            dist_from_high = 0.0
+            dist_from_low = 0.0
+
+        momentum_5s = self.binance.get_short_momentum(5)
+        momentum_30s = self.binance.get_short_momentum(30)
+        momentum_60s = self.binance.get_short_momentum(60)
+        momentum_divergence = int(
+            momentum_5s != 0
+            and momentum_60s != 0
+            and ((momentum_5s > 0) != (momentum_60s > 0))
+        )
+
+        now_utc = datetime.now(timezone.utc)
+        hour_of_day = now_utc.hour + now_utc.minute / 60.0
+        day_of_week = now_utc.weekday()
+        is_us_market_hours = int(13.5 <= hour_of_day <= 20.0)
+
+        return {
+            "btc_volatility_15": btc_volatility_15,
+            "btc_volatility_60": btc_volatility_60,
+            "btc_vol_ratio": btc_vol_ratio,
+            "dist_from_high": dist_from_high,
+            "dist_from_low": dist_from_low,
+            "momentum_5s": momentum_5s,
+            "momentum_30s": momentum_30s,
+            "momentum_divergence": momentum_divergence,
+            "hour_of_day": hour_of_day,
+            "day_of_week": day_of_week,
+            "is_us_market_hours": is_us_market_hours,
+        }
+
+    @staticmethod
+    def _volatility_from_prices(prices: list[float], minimum_points: int):
+        if len(prices) < minimum_points:
+            return 0.0
+
+        returns = []
+        for idx in range(1, len(prices)):
+            previous = prices[idx - 1]
+            current = prices[idx]
+            if previous:
+                returns.append((current - previous) / previous)
+
+        if len(returns) <= 1:
+            return 0.0
+
+        return stdev(returns)
     def _print_status(self, decision, binance_signal, fills):
         """Print a compact status line."""
         risk_stats = self.risk.get_stats()
@@ -323,17 +487,39 @@ class PolymarketBot:
             log.error(f"Failed to save daily PnL: {e}")
 
     async def _settle_resolved_markets(self):
-        """Resolve markets once Polymarket exposes a decisive outcome."""
+        """Resolve matured markets once Gamma confirms the winning side."""
         market_ids = list(self.risk.positions.keys())
         for market_id in market_ids:
             if database.is_market_settled(self.db, market_id):
                 continue
 
-            market = await self.polymarket.fetch_market_metadata(market_id)
-            settlement = self.polymarket.get_settlement_info(market)
-            if not settlement:
+            market = self.polymarket.known_markets.get(market_id)
+            if not market:
                 continue
 
+            end_date = market.get("end_date", "")
+            if not end_date:
+                continue
+
+            try:
+                end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp()
+            except Exception as e:
+                log.debug(f"Settlement parse error for {market_id}: {e}")
+                continue
+
+            if time.time() <= end_ts:
+                continue
+
+            winner = await self._fetch_confirmed_winner(market)
+            if not winner:
+                continue
+
+            settlement = {
+                "winning_side": winner,
+                "payout_yes": 1.0 if winner == "YES" else 0.0,
+                "payout_no": 1.0 if winner == "NO" else 0.0,
+                "source": "gamma-outcome-prices",
+            }
             result = self.risk.settle_market(
                 market_id,
                 settlement["payout_yes"],
