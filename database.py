@@ -12,6 +12,36 @@ import config
 from model_features import model_feature_names
 
 
+TICK_COLUMN_DEFINITIONS = {
+    "btc_volatility_15": "REAL DEFAULT 0",
+    "btc_volatility_60": "REAL DEFAULT 0",
+    "btc_vol_ratio": "REAL DEFAULT 1.0",
+    "dist_from_high": "REAL DEFAULT 0",
+    "dist_from_low": "REAL DEFAULT 0",
+    "momentum_5s": "REAL DEFAULT 0",
+    "momentum_30s": "REAL DEFAULT 0",
+    "momentum_divergence": "INTEGER DEFAULT 0",
+    "hour_of_day": "REAL DEFAULT 0",
+    "day_of_week": "INTEGER DEFAULT 0",
+    "is_us_market_hours": "INTEGER DEFAULT 0",
+    "btc_funding_rate": "REAL DEFAULT 0",
+    "mid_source": "TEXT DEFAULT 'polymarket'",
+}
+
+
+def ensure_tick_columns(conn):
+    """Backfill schema changes safely for existing SQLite databases."""
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(ticks)").fetchall()
+    }
+
+    for column, definition in TICK_COLUMN_DEFINITIONS.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE ticks ADD COLUMN {column} {definition}")
+
+    conn.commit()
+
+
 def init_db(path=None):
     """Create database and tables if they don't exist."""
     path = path or config.LOG_DB_PATH
@@ -40,6 +70,19 @@ def init_db(path=None):
             poly_orderbook_imbalance REAL,  -- -1 to +1
             poly_volume_24h REAL,
             poly_seconds_remaining REAL,
+            btc_volatility_15 REAL DEFAULT 0,
+            btc_volatility_60 REAL DEFAULT 0,
+            btc_vol_ratio REAL DEFAULT 1.0,
+            dist_from_high REAL DEFAULT 0,
+            dist_from_low REAL DEFAULT 0,
+            momentum_5s REAL DEFAULT 0,
+            momentum_30s REAL DEFAULT 0,
+            momentum_divergence INTEGER DEFAULT 0,
+            hour_of_day REAL DEFAULT 0,
+            day_of_week INTEGER DEFAULT 0,
+            is_us_market_hours INTEGER DEFAULT 0,
+            btc_funding_rate REAL DEFAULT 0,
+            mid_source TEXT DEFAULT 'polymarket',
             -- Signal 3: Cross-platform
             kalshi_yes_price REAL,
             kalshi_no_price REAL,
@@ -122,6 +165,8 @@ def init_db(path=None):
         )
     """)
 
+    ensure_tick_columns(conn)
+
     conn.commit()
     return conn
 
@@ -134,6 +179,10 @@ def log_tick(conn, data: dict):
         "poly_yes_best_ask", "poly_no_best_bid", "poly_no_best_ask",
         "poly_mid_price", "poly_spread", "poly_orderbook_imbalance",
         "poly_volume_24h", "poly_seconds_remaining",
+        "btc_volatility_15", "btc_volatility_60", "btc_vol_ratio",
+        "dist_from_high", "dist_from_low", "momentum_5s", "momentum_30s",
+        "momentum_divergence", "hour_of_day", "day_of_week",
+        "is_us_market_hours", "btc_funding_rate", "mid_source",
         "kalshi_yes_price", "kalshi_no_price", "cross_platform_spread",
         "mode", "lean_direction", "lean_confidence", "classifier_source"
     ]
@@ -186,17 +235,18 @@ def get_tick_count(conn):
 def get_training_data(conn):
     """Pull labeled tick data for CatBoost training."""
     feature_columns = model_feature_names()
-    select_columns = ",\n            ".join(
-        ["timestamp", *feature_columns, "optimal_lean"]
-    )
-    query = f"""
+    feature_sql = ",\n            ".join(feature_columns)
+    query = """
         SELECT
-            {select_columns}
+            timestamp,
+            {feature_sql},
+            optimal_lean
         FROM ticks
         WHERE btc_price_after_60s IS NOT NULL
           AND optimal_lean IS NOT NULL
+          AND COALESCE(mid_source, 'polymarket') = 'polymarket'
         ORDER BY timestamp ASC
-    """
+    """.format(feature_sql=feature_sql)
     rows = conn.execute(query).fetchall()
     columns = ["timestamp", *feature_columns, "optimal_lean"]
     return rows, columns
