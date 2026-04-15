@@ -128,6 +128,7 @@ SETTLEMENT_LOSER_MAX_PRICE = 0.01
 # ═══════════════════════════════════════════
 #  AUTO TUNER (CatBoost Training)
 # ═══════════════════════════════════════════
+LABELING_INTERVAL_SEC = 30  # keep backfill + labels fresh even when training is off
 AUTO_TRAINING_ENABLED = _env_flag("AUTO_TRAINING_ENABLED", False)
 MIN_SAMPLES_TO_TRAIN = 5000  # minimum rows before first training
 RETRAIN_INTERVAL_ROWS = 2000  # retrain every N new rows

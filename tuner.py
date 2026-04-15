@@ -296,19 +296,27 @@ def run_tuning_cycle(conn, price_history: list) -> dict:
 
     Returns status dict.
     """
+    status = run_labeling_cycle(conn, price_history)
+
+    training_status = run_training_cycle(conn)
+    if training_status.get("trained"):
+        status.update(training_status)
+    return status
+
+
+def run_labeling_cycle(conn, price_history: list) -> dict:
+    """Keep future-price backfill and optimal lean labels up to date."""
     status = {"backfilled": 0, "labeled": 0, "trained": False}
-
-    # Step 1: backfill
     backfill_future_prices(conn, price_history)
+    status["labeled"] = compute_optimal_leans(conn)
+    return status
 
-    # Step 2: label
-    labeled = compute_optimal_leans(conn)
-    status["labeled"] = labeled
 
-    # Step 3: train if ready
+def run_training_cycle(conn) -> dict:
+    """Train only when enough freshly labeled data is available."""
+    status = {"trained": False}
     if should_train(conn):
         result = train_model(conn)
         status["trained"] = True
         status["training_result"] = result
-
     return status
