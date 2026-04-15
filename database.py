@@ -55,6 +55,18 @@ TICK_COLUMNS = [
 ]
 
 TICK_COLUMN_DEFINITIONS = dict(TICK_COLUMNS)
+MARKET_SETTLEMENT_COLUMNS = {
+    "market_id": "TEXT PRIMARY KEY",
+    "settled_at": "REAL",
+    "winning_side": "TEXT",
+    "payout_yes": "REAL",
+    "payout_no": "REAL",
+    "num_yes_shares": "REAL",
+    "num_no_shares": "REAL",
+    "realized_pnl": "REAL",
+    "source": "TEXT",
+    "mode": "INTEGER",
+}
 TICK_BACKFILL_COLUMNS = {
     "btc_price_after_30s",
     "btc_price_after_60s",
@@ -76,6 +88,18 @@ def ensure_tick_columns(conn):
     for column, definition in TICK_COLUMN_DEFINITIONS.items():
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE ticks ADD COLUMN {column} {definition}")
+
+    conn.commit()
+
+
+def ensure_table_columns(conn, table_name: str, column_definitions: dict[str, str]):
+    existing_columns = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+    for column, definition in column_definitions.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {definition}")
 
     conn.commit()
 
@@ -160,11 +184,13 @@ def init_db(path=None):
             num_yes_shares REAL,
             num_no_shares REAL,
             realized_pnl REAL,
-            source TEXT
+            source TEXT,
+            mode INTEGER
         )
     """)
 
-    ensure_tick_columns(conn)
+    ensure_table_columns(conn, "ticks", TICK_COLUMN_DEFINITIONS)
+    ensure_table_columns(conn, "market_settlements", MARKET_SETTLEMENT_COLUMNS)
 
     conn.commit()
     return conn
@@ -276,13 +302,114 @@ def record_market_settlement(conn, data: dict):
     conn.execute("""
         INSERT OR REPLACE INTO market_settlements (
             market_id, settled_at, winning_side, payout_yes, payout_no,
-            num_yes_shares, num_no_shares, realized_pnl, source
+            num_yes_shares, num_no_shares, realized_pnl, source, mode
         ) VALUES (
             :market_id, :settled_at, :winning_side, :payout_yes, :payout_no,
-            :num_yes_shares, :num_no_shares, :realized_pnl, :source
+            :num_yes_shares, :num_no_shares, :realized_pnl, :source, :mode
         )
     """, data)
     conn.commit()
+
+
+def get_win_rate_summary(conn):
+    rows = conn.execute(
+        """
+        SELECT
+            ms.market_id,
+            ms.realized_pnl,
+            COALESCE(
+                ms.mode,
+                (
+                    SELECT pt.mode
+                    FROM paper_trades pt
+                    WHERE pt.market_id = ms.market_id
+                      AND pt.mode IS NOT NULL
+                    GROUP BY pt.mode
+                    ORDER BY COUNT(*) DESC, pt.mode ASC
+                    LIMIT 1
+                )
+            ) AS resolved_mode
+        FROM market_settlements ms
+        WHERE COALESCE(ms.source, '') != 'synthetic-flat-unwind'
+        """
+    ).fetchall()
+
+    mode_stats = {
+        mode: {
+            "mode": mode,
+            "label": {1: "Quiet", 2: "Lean", 3: "Event", 4: "Arb"}.get(mode, "?"),
+            "settled_count": 0,
+            "wins": 0,
+            "losses": 0,
+            "pushes": 0,
+            "decided_count": 0,
+            "win_rate": None,
+            "total_pnl": 0.0,
+        }
+        for mode in range(1, 5)
+    }
+
+    overall = {
+        "settled_count": 0,
+        "wins": 0,
+        "losses": 0,
+        "pushes": 0,
+        "decided_count": 0,
+        "win_rate": None,
+        "total_pnl": 0.0,
+    }
+
+    for _, realized_pnl, resolved_mode in rows:
+        pnl = float(realized_pnl or 0.0)
+        overall["settled_count"] += 1
+        overall["total_pnl"] += pnl
+
+        bucket = None
+        if resolved_mode in mode_stats:
+            bucket = mode_stats[resolved_mode]
+            bucket["settled_count"] += 1
+            bucket["total_pnl"] += pnl
+
+        if pnl > 0:
+            outcome = "wins"
+        elif pnl < 0:
+            outcome = "losses"
+        else:
+            outcome = "pushes"
+
+        overall[outcome] += 1
+        if bucket is not None:
+            bucket[outcome] += 1
+
+    overall["decided_count"] = overall["wins"] + overall["losses"]
+    if overall["decided_count"] > 0:
+        overall["win_rate"] = round(overall["wins"] / overall["decided_count"], 4)
+    overall["total_pnl"] = round(overall["total_pnl"], 4)
+
+    for stats in mode_stats.values():
+        stats["decided_count"] = stats["wins"] + stats["losses"]
+        if stats["decided_count"] > 0:
+            stats["win_rate"] = round(stats["wins"] / stats["decided_count"], 4)
+        stats["total_pnl"] = round(stats["total_pnl"], 4)
+
+    ranked_modes = [
+        stats for stats in mode_stats.values()
+        if stats["decided_count"] > 0
+    ]
+    ranked_modes.sort(
+        key=lambda stats: (
+            stats["win_rate"],
+            stats["decided_count"],
+            stats["total_pnl"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "overall": overall,
+        "by_mode": list(mode_stats.values()),
+        "best_mode": ranked_modes[0] if ranked_modes else None,
+    }
 
 
 def upsert_daily_pnl(conn, data: dict):

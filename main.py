@@ -37,7 +37,7 @@ import database
 from signals import BinanceFeed, PolymarketFeed, KalshiFeed
 from news_llm import NewsLLMSignal
 from engine import RegimeClassifier, PaperTrader, RiskManager
-from tuner import run_tuning_cycle
+from tuner import run_labeling_cycle, run_training_cycle
 
 # ═══════════════════════════════════════════
 #  LOGGING
@@ -75,6 +75,8 @@ class PolymarketBot:
         self.tick_count = 0
         self._start_time = time.time()
         self.price_history = deque(maxlen=50000)  # for backfill
+        self.last_labeling_time = 0
+        self.labeling_interval = config.LABELING_INTERVAL_SEC
         self.last_tuning_time = 0
         self.tuning_interval = 300  # run tuner every 5 minutes
         self.last_status_time = 0
@@ -158,17 +160,31 @@ class PolymarketBot:
         for fill in fills:
             order = fill["order"]
             try:
-                database.log_paper_trade(self.db, {
-                    "timestamp": order.fill_timestamp,
-                    "market_id": order.market_id,
-                    "side": order.side,
-                    "order_type": order.order_type,
-                    "price": order.fill_price,
-                    "size": order.size,
-                    "mode": order.mode,
-                    "lean_direction": order.lean_direction,
-                    "lean_confidence": order.lean_confidence,
-                })
+                if order.db_trade_id:
+                    database.mark_fill(
+                        self.db,
+                        order.db_trade_id,
+                        order.fill_price,
+                        fill.get("realized_pnl", 0.0),
+                    )
+                else:
+                    trade_id = database.log_paper_trade(self.db, {
+                        "timestamp": order.timestamp,
+                        "market_id": order.market_id,
+                        "side": order.side,
+                        "order_type": order.order_type,
+                        "price": order.price,
+                        "size": order.size,
+                        "mode": order.mode,
+                        "lean_direction": order.lean_direction,
+                        "lean_confidence": order.lean_confidence,
+                    })
+                    database.mark_fill(
+                        self.db,
+                        trade_id,
+                        order.fill_price,
+                        fill.get("realized_pnl", 0.0),
+                    )
             except Exception:
                 pass
 
@@ -257,13 +273,19 @@ class PolymarketBot:
         except Exception as e:
             log.error(f"DB log error: {e}")
 
-        # ── Run tuner periodically ──
-        if now - self.last_tuning_time > self.tuning_interval:
+        # ── Keep labels fresh even when model training is disabled ──
+        if now - self.last_labeling_time > self.labeling_interval:
+            self.last_labeling_time = now
+            try:
+                run_labeling_cycle(self.db, list(self.price_history))
+            except Exception as e:
+                log.error(f"Labeling error: {e}")
+
+        # ── Run CatBoost training only when explicitly enabled ──
+        if config.AUTO_TRAINING_ENABLED and now - self.last_tuning_time > self.tuning_interval:
             self.last_tuning_time = now
             try:
-                tuner_status = run_tuning_cycle(
-                    self.db, list(self.price_history)
-                )
+                tuner_status = run_training_cycle(self.db)
                 if tuner_status.get("trained"):
                     result = tuner_status["training_result"]
                     if result.get("deployed") and config.USE_MODEL_IF_AVAILABLE:
@@ -391,6 +413,7 @@ class PolymarketBot:
                 "num_no_shares": result["num_no_shares"],
                 "realized_pnl": 0.0,
                 "source": "synthetic-flat-unwind",
+                "mode": result.get("mode"),
             })
         except Exception as e:
             log.debug(f"Failed to record synthetic unwind: {e}")
@@ -581,6 +604,7 @@ class PolymarketBot:
                 "num_no_shares": result["num_no_shares"],
                 "realized_pnl": result["realized_pnl"],
                 "source": settlement["source"],
+                "mode": result.get("mode"),
             })
             log.info(
                 f"  SETTLED: {market_id[:8]} winner={settlement['winning_side']} "

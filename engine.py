@@ -49,6 +49,7 @@ class Position:
     no_avg_cost: float = 0.0
     total_cost: float = 0.0
     realized_pnl: float = 0.0
+    mode_costs: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -305,8 +306,17 @@ class RiskManager:
         """Current dollars tied up in unresolved positions."""
         return sum(position.total_cost for position in self.positions.values())
 
+    def primary_mode(self, market_id: str) -> Optional[int]:
+        pos = self.positions.get(market_id)
+        if not pos or not pos.mode_costs:
+            return None
+        return max(
+            sorted(pos.mode_costs.items()),
+            key=lambda item: item[1],
+        )[0]
+
     def update_position(self, market_id: str, side: str, shares: float,
-                        price: float, is_buy: bool):
+                        price: float, is_buy: bool, mode: Optional[int] = None):
         """Update position after a fill and return realized PnL for this action."""
         if market_id not in self.positions:
             self.positions[market_id] = Position(market_id=market_id)
@@ -331,8 +341,23 @@ class RiskManager:
                     )
                 pos.no_shares = total_shares
             pos.total_cost += cost
+            if mode is not None:
+                pos.mode_costs[mode] = pos.mode_costs.get(mode, 0.0) + cost
             self.balance -= cost
         else:
+            cost_released = (
+                pos.yes_avg_cost * shares if side == "YES" else pos.no_avg_cost * shares
+            )
+            basis_total = sum(pos.mode_costs.values())
+            if basis_total > 0 and cost_released > 0:
+                reduction_ratio = min(1.0, cost_released / basis_total)
+                for tracked_mode in list(pos.mode_costs):
+                    remaining_cost = pos.mode_costs[tracked_mode] * (1.0 - reduction_ratio)
+                    if remaining_cost <= 1e-9:
+                        pos.mode_costs.pop(tracked_mode, None)
+                    else:
+                        pos.mode_costs[tracked_mode] = remaining_cost
+
             revenue = shares * price
             if side == "YES":
                 pnl = (price - pos.yes_avg_cost) * shares
@@ -344,6 +369,9 @@ class RiskManager:
             pos.total_cost = max(0, pos.total_cost - revenue)
             self.balance += revenue
             realized_pnl = pnl
+
+        if pos.yes_shares <= 0 and pos.no_shares <= 0:
+            pos.mode_costs.clear()
 
         # Track peak
         self.peak_balance = max(self.peak_balance, self.balance)
@@ -366,6 +394,7 @@ class RiskManager:
         no_cost = no_shares * pos.no_avg_cost
         payout = yes_shares * payout_yes + no_shares * payout_no
         realized_pnl = (payout - yes_cost - no_cost)
+        mode = self.primary_mode(market_id)
 
         self.balance += payout
         pos.realized_pnl += realized_pnl
@@ -374,11 +403,13 @@ class RiskManager:
         pos.no_shares = 0.0
         pos.yes_avg_cost = 0.0
         pos.no_avg_cost = 0.0
+        pos.mode_costs.clear()
         self.peak_balance = max(self.peak_balance, self.balance)
         del self.positions[market_id]
 
         return {
             "market_id": market_id,
+            "mode": mode,
             "num_yes_shares": yes_shares,
             "num_no_shares": no_shares,
             "payout_yes": payout_yes,
@@ -404,6 +435,7 @@ class RiskManager:
 
         result = {
             "market_id": market_id,
+            "mode": self.primary_mode(market_id),
             "num_yes_shares": round(pos.yes_shares, 4),
             "num_no_shares": round(pos.no_shares, 4),
             "payout_yes": 0.0,
@@ -519,9 +551,9 @@ class PaperTrader:
                 self.total_fills += 1
 
                 is_buy = order.order_type == "BID"
-                self.risk.update_position(
+                realized_pnl = self.risk.update_position(
                     order.market_id, order.side,
-                    order.size, order.fill_price, is_buy
+                    order.size, order.fill_price, is_buy, mode=order.mode
                 )
 
                 rebate = order.size * order.price * (config.MAKER_REBATE_BPS / 10000)
@@ -530,6 +562,7 @@ class PaperTrader:
                 fills.append({
                     "order": order,
                     "rebate": rebate,
+                    "realized_pnl": realized_pnl,
                 })
                 log.info(
                     f"  FILL: {order.order_type} {order.size} {order.side} "

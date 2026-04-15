@@ -208,6 +208,7 @@ async def get_training():
         "total_ticks": total_ticks,
         "labeled_ticks": labeled,
         "unlabeled_ticks": unlabeled,
+        "auto_training_enabled": config.AUTO_TRAINING_ENABLED,
         "min_samples_needed": config.MIN_SAMPLES_TO_TRAIN,
         "progress_pct": round(min(100, labeled / max(1, config.MIN_SAMPLES_TO_TRAIN) * 100), 1),
         "classifier_source": source,
@@ -243,3 +244,11 @@ async def get_mode_distribution():
         ],
         "total": total,
     }
+
+
+@app.get("/api/win_rates")
+async def get_win_rates():
+    """Settled win rates overall and by mode."""
+    if not _bot_ref:
+        return {"error": "Bot not started"}
+    return database.get_win_rate_summary(_bot_ref.db)
