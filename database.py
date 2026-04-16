@@ -290,6 +290,53 @@ def get_daily_pnl(conn, date_str):
     ).fetchone()
 
 
+def get_settlement_summary(conn, start_ts=None, end_ts=None):
+    """Aggregate realized performance from settled markets only."""
+    where_clauses = ["COALESCE(source, '') != 'synthetic-flat-unwind'"]
+    params = []
+    if start_ts is not None:
+        where_clauses.append("settled_at >= ?")
+        params.append(start_ts)
+    if end_ts is not None:
+        where_clauses.append("settled_at < ?")
+        params.append(end_ts)
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS settled_count,
+            SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END) AS losses,
+            SUM(CASE WHEN realized_pnl = 0 THEN 1 ELSE 0 END) AS pushes,
+            COALESCE(SUM(realized_pnl), 0.0) AS total_pnl
+        FROM market_settlements
+        {where_sql}
+        """,
+        params,
+    ).fetchone()
+
+    settled_count = int(row[0] or 0)
+    wins = int(row[1] or 0)
+    losses = int(row[2] or 0)
+    pushes = int(row[3] or 0)
+    decided_count = wins + losses
+    total_pnl = float(row[4] or 0.0)
+
+    return {
+        "settled_count": settled_count,
+        "wins": wins,
+        "losses": losses,
+        "pushes": pushes,
+        "decided_count": decided_count,
+        "win_rate": (wins / decided_count) if decided_count else None,
+        "total_pnl": round(total_pnl, 4),
+    }
+
+
 def is_market_settled(conn, market_id: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM market_settlements WHERE market_id=? LIMIT 1",

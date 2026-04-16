@@ -98,7 +98,7 @@ ARB_MAX_COMBINED_COST = 0.97  # buy both sides for < $0.97
 # ═══════════════════════════════════════════
 #  PAPER TRADER (Simulated Execution)
 # ═══════════════════════════════════════════
-DEFAULT_ORDER_SIZE = 50  # shares per side
+DEFAULT_ORDER_SIZE = 10  # shares per side; keep paper sizing honest while validating edge
 SPREAD_BPS = 200  # 2% spread in basis points (each side 1% from mid)
 MAX_INVENTORY_PER_SIDE = 500  # max shares held on one side
 MAX_TOTAL_EXPOSURE = 1000.0  # max USD exposure across all positions
@@ -116,6 +116,19 @@ SYNTHETIC_MID_SENSITIVITY = 10.0  # 0.1% BTC move ≈ 1¢ contract move
 SYNTHETIC_MID_MIN = 0.10
 SYNTHETIC_MID_MAX = 0.90
 SYNTHETIC_REFERENCE_RESET_SEC = 300
+ALLOW_NAKED_ASKS = _env_flag("ALLOW_NAKED_ASKS", False)
+ENABLE_QUIET_MODE_QUOTES = _env_flag("ENABLE_QUIET_MODE_QUOTES", False)
+QUOTE_MIN_SECONDS_REMAINING = 240  # avoid late-window coin-flip fills
+QUOTE_MIN_MID = 0.15  # avoid extreme probability zones where one tick dominates P&L
+QUOTE_MAX_MID = 0.85
+QUIET_MAX_ABS_BTC_MOMENTUM = 0.0002  # 2 bps; above this is not actually quiet
+QUIET_MAX_ABS_SHORT_MOMENTUM = 0.0002
+
+# Settled truth kill switch. This uses only resolved markets, not cash balance.
+SETTLED_TRUTH_KILL_SWITCH_ENABLED = _env_flag("SETTLED_TRUTH_KILL_SWITCH_ENABLED", True)
+SETTLED_TRUTH_MIN_MARKETS = 20
+SETTLED_TRUTH_MIN_WIN_RATE = 0.45
+SETTLED_TRUTH_MAX_LOSS = -100.0
 
 # ═══════════════════════════════════════════
 #  SETTLEMENT (Market Resolution)

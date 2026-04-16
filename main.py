@@ -234,8 +234,9 @@ class PolymarketBot:
         # ── Step 4: Replenish quotes only if needed ──
         orders = []
         self._cleanup_synthetic_position()
+        self._apply_settled_truth_kill_switch()
         if not self.risk.halted:
-            orders = self.trader.generate_orders(decision, sig2)
+            orders = self.trader.generate_orders(decision, combined)
 
         # Log new orders
         for order in orders:
@@ -306,7 +307,7 @@ class PolymarketBot:
 
         lookup_params = []
         if market.get("id"):
-            lookup_params.append({"condition_id": market["id"]})
+            lookup_params.append({"condition_ids": market["id"]})
         if market.get("gamma_market_id"):
             lookup_params.append({"id": market["gamma_market_id"]})
         if market.get("slug"):
@@ -422,6 +423,50 @@ class PolymarketBot:
             "Released synthetic fallback position at cost to free exposure: "
             f"refund=${result['payout']:.2f}"
         )
+
+    def _apply_settled_truth_kill_switch(self):
+        """Halt new orders when resolved markets show the strategy is losing."""
+        if not config.SETTLED_TRUTH_KILL_SWITCH_ENABLED:
+            return False
+
+        try:
+            summary = database.get_settlement_summary(self.db)
+        except Exception as e:
+            log.debug(f"Settled truth kill switch skipped: {e}")
+            return False
+
+        settled_count = summary.get("settled_count", 0)
+        decided_count = summary.get("decided_count", 0)
+        win_rate = summary.get("win_rate")
+        total_pnl = summary.get("total_pnl", 0.0)
+
+        if settled_count < config.SETTLED_TRUTH_MIN_MARKETS or decided_count <= 0:
+            return False
+
+        reasons = []
+        if total_pnl <= config.SETTLED_TRUTH_MAX_LOSS:
+            reasons.append(
+                f"settled P&L ${total_pnl:+.2f} <= ${config.SETTLED_TRUTH_MAX_LOSS:+.2f}"
+            )
+        if win_rate is not None and win_rate < config.SETTLED_TRUTH_MIN_WIN_RATE:
+            reasons.append(
+                f"settled win rate {win_rate:.1%} < {config.SETTLED_TRUTH_MIN_WIN_RATE:.1%}"
+            )
+
+        if not reasons:
+            return False
+
+        reason = (
+            "Settled truth kill switch: "
+            + "; ".join(reasons)
+            + f" over {settled_count} settled markets"
+        )
+        if not self.risk.halted or self.risk.halt_reason != reason:
+            log.warning(reason)
+        self.risk.halted = True
+        self.risk.halt_reason = reason
+        self.trader.cancel_all()
+        return True
 
     def _compute_feature_block(self, sig1: dict):
         """Build volatility, structure, momentum, and time features."""
@@ -539,7 +584,7 @@ class PolymarketBot:
                 "date": today,
                 "starting_balance": self.risk.daily_starting_balance,
                 "ending_balance": stats["balance"],
-                "total_pnl": stats["daily_pnl"],
+                "total_pnl": stats["cash_daily_pnl"],
                 "num_trades": self.trader.total_orders_placed,
                 "num_fills": self.trader.total_fills,
                 "mode1_pnl": 0,  # TODO: track per-mode PnL

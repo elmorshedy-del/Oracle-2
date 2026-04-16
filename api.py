@@ -35,6 +35,11 @@ def set_bot_reference(bot):
     _bot_ref = bot
 
 
+def _start_of_local_day_timestamp():
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp()
+
+
 # ── Routes ──
 
 @app.get("/")
@@ -52,6 +57,11 @@ async def get_status():
     risk = bot.risk.get_stats()
     trader = bot.trader.get_stats()
     tick_count = database.get_tick_count(bot.db)
+    settled_total = database.get_settlement_summary(bot.db)
+    settled_today = database.get_settlement_summary(
+        bot.db,
+        start_ts=_start_of_local_day_timestamp(),
+    )
 
     sig1 = bot.binance.get_signal()
     sig2 = bot.polymarket.get_signal()
@@ -94,6 +104,16 @@ async def get_status():
             "lean_confidence": decision.lean_confidence,
             "source": decision.source,
             "reason": decision.reason,
+        },
+        "performance": {
+            "settled_total_pnl": settled_total["total_pnl"],
+            "settled_today_pnl": settled_today["total_pnl"],
+            "settled_win_rate": settled_total["win_rate"],
+            "settled_count": settled_total["settled_count"],
+            "decided_count": settled_total["decided_count"],
+            "wins": settled_total["wins"],
+            "losses": settled_total["losses"],
+            "pushes": settled_total["pushes"],
         },
         "risk": risk,
         "trader": trader,

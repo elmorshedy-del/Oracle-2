@@ -228,6 +228,15 @@
   }
   .stat-value.positive { color: var(--green); }
   .stat-value.negative { color: var(--red); }
+  .truth-note {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-dim);
+    font-size: 12px;
+    margin-bottom: 18px;
+    padding: 10px 12px;
+  }
 
   /* ── Training Progress ── */
   .progress-bar {
@@ -447,7 +456,7 @@
     <div class="mode-dist" id="mode-dist"></div>
     <div id="mode-dist-labels" style="display:flex; gap:12px; font-size:11px; color:var(--text-dim)"></div>
 
-    <div class="panel-title" style="margin-top:20px">Mode Win Rate</div>
+    <div class="panel-title" style="margin-top:20px">Mode Settled Truth</div>
     <div class="mode-win-list" id="mode-win-list">
       <div class="mode-win-row">
         <span style="color:var(--text-dim)">Waiting for settled markets...</span>
@@ -459,29 +468,33 @@
   <div class="panel">
     <div class="stats-grid">
       <div class="stat-card">
-        <div class="stat-label">Balance</div>
+        <div class="stat-label">Cash Balance</div>
         <div class="stat-value" id="stat-balance">$5,000</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Total P&L</div>
-        <div class="stat-value" id="stat-pnl">$0.00</div>
+        <div class="stat-label">Settled P&amp;L</div>
+        <div class="stat-value" id="stat-settled-pnl">$0.00</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Today P&L</div>
-        <div class="stat-value" id="stat-daily-pnl">$0.00</div>
+        <div class="stat-label">Settled Today</div>
+        <div class="stat-value" id="stat-settled-today">$0.00</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Fill Rate</div>
         <div class="stat-value" id="stat-fill-rate">0%</div>
       </div>
       <div class="stat-card">
+        <div class="stat-label">Open Exposure</div>
+        <div class="stat-value" id="stat-open-exposure">$0.00</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-label">Settled Win Rate</div>
         <div class="stat-value" id="stat-win-rate">—</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-label">Best Mode</div>
-        <div class="stat-value" id="stat-best-mode">—</div>
-      </div>
+    </div>
+
+    <div class="truth-note" id="truth-note">
+      Settled stats include only resolved markets. Cash balance can move before markets settle.
     </div>
 
     <div class="panel-title">BTC Price</div>
@@ -685,16 +698,24 @@ async function fetchStatus() {
     document.getElementById('sig-llm-calls').textContent = d.signals.news_call_count || 0;
 
     // Stats
-    document.getElementById('stat-balance').textContent = '$' + (d.risk.balance || 0).toLocaleString(undefined, {maximumFractionDigits:0});
-    const pnl = d.risk.total_pnl || 0;
-    const pnlEl = document.getElementById('stat-pnl');
-    pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
-    pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'positive' : 'negative');
-    const dpnl = d.risk.daily_pnl || 0;
-    const dpnlEl = document.getElementById('stat-daily-pnl');
-    dpnlEl.textContent = (dpnl >= 0 ? '+$' : '-$') + Math.abs(dpnl).toFixed(2);
-    dpnlEl.className = 'stat-value ' + (dpnl >= 0 ? 'positive' : 'negative');
+    const perf = d.performance || {};
+    document.getElementById('stat-balance').textContent = '$' + (d.risk.cash_balance || d.risk.balance || 0).toLocaleString(undefined, {maximumFractionDigits:0});
+    const settledPnl = perf.settled_total_pnl || 0;
+    const settledPnlEl = document.getElementById('stat-settled-pnl');
+    settledPnlEl.textContent = (settledPnl >= 0 ? '+$' : '-$') + Math.abs(settledPnl).toFixed(2);
+    settledPnlEl.className = 'stat-value ' + (settledPnl >= 0 ? 'positive' : 'negative');
+    const settledToday = perf.settled_today_pnl || 0;
+    const settledTodayEl = document.getElementById('stat-settled-today');
+    settledTodayEl.textContent = (settledToday >= 0 ? '+$' : '-$') + Math.abs(settledToday).toFixed(2);
+    settledTodayEl.className = 'stat-value ' + (settledToday >= 0 ? 'positive' : 'negative');
     document.getElementById('stat-fill-rate').textContent = ((d.trader.fill_rate || 0) * 100).toFixed(0) + '%';
+    document.getElementById('stat-open-exposure').textContent = '$' + ((d.risk.total_exposure || 0).toFixed(2));
+    document.getElementById('stat-win-rate').textContent = perf.settled_win_rate == null
+      ? '—'
+      : (perf.settled_win_rate * 100).toFixed(1) + '%';
+    document.getElementById('truth-note').textContent =
+      `Settled stats are resolved-market truth: ${perf.wins || 0}W / ${perf.losses || 0}L / ${perf.pushes || 0}P across ${perf.settled_count || 0} settled markets. Cash balance includes unresolved positions and maker rebates.`;
+
     // System
     document.getElementById('sys-ticks').textContent = (d.tick_count || 0).toLocaleString();
     document.getElementById('sys-orders').textContent = d.trader.open_orders || 0;
@@ -718,12 +739,9 @@ async function fetchWinRates(force = false) {
     lastWinRatesFetch = now;
 
     const overall = d.overall || {};
-    const bestMode = d.best_mode || null;
     const overallWinRate = overall.win_rate;
     document.getElementById('stat-win-rate').textContent =
       overallWinRate == null ? '—' : (overallWinRate * 100).toFixed(1) + '%';
-    document.getElementById('stat-best-mode').textContent =
-      bestMode ? `${bestMode.label} ${(bestMode.win_rate * 100).toFixed(0)}%` : '—';
 
     const modeWinList = document.getElementById('mode-win-list');
     const modeRows = (d.by_mode || []).filter(m => m.settled_count > 0);
