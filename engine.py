@@ -268,7 +268,21 @@ class RiskManager:
         self.halted = False
         self.halt_reason = ""
 
-    def check_order(self, market_id: str, side: str, size: float, price: float) -> tuple:
+    def available_shares(self, market_id: str, side: str) -> float:
+        """Shares currently owned and therefore available to sell."""
+        pos = self.positions.get(market_id)
+        if not pos:
+            return 0.0
+        return pos.yes_shares if side == "YES" else pos.no_shares
+
+    def check_order(
+        self,
+        market_id: str,
+        side: str,
+        size: float,
+        price: float,
+        order_type: str = "BID",
+    ) -> tuple:
         """
         Returns (allowed: bool, adjusted_size: float, reason: str)
         """
@@ -282,10 +296,16 @@ class RiskManager:
             self.halt_reason = f"Daily drawdown limit hit: {drawdown:.2%}"
             return False, 0, self.halt_reason
 
+        if order_type == "ASK" and not config.ALLOW_NAKED_ASKS:
+            available = self.available_shares(market_id, side)
+            if available <= 0:
+                return False, 0, f"No {side} inventory available to sell"
+            size = min(size, available)
+
         # Inventory check
         pos = self.positions.get(market_id, Position(market_id=market_id))
         current_side_shares = pos.yes_shares if side == "YES" else pos.no_shares
-        if current_side_shares + size > config.MAX_INVENTORY_PER_SIDE:
+        if order_type == "BID" and current_side_shares + size > config.MAX_INVENTORY_PER_SIDE:
             adjusted = config.MAX_INVENTORY_PER_SIDE - current_side_shares
             if adjusted <= 0:
                 return False, 0, f"Max inventory reached for {side}"
@@ -294,7 +314,7 @@ class RiskManager:
         # Total exposure check
         total_exposure = self.total_exposure()
         order_cost = size * price
-        if total_exposure + order_cost > config.MAX_TOTAL_EXPOSURE:
+        if order_type == "BID" and total_exposure + order_cost > config.MAX_TOTAL_EXPOSURE:
             max_allowed = config.MAX_TOTAL_EXPOSURE - total_exposure
             if max_allowed <= 0:
                 return False, 0, "Max total exposure reached"
@@ -318,6 +338,25 @@ class RiskManager:
     def update_position(self, market_id: str, side: str, shares: float,
                         price: float, is_buy: bool, mode: Optional[int] = None):
         """Update position after a fill and return realized PnL for this action."""
+        if not is_buy and not config.ALLOW_NAKED_ASKS:
+            available = self.available_shares(market_id, side)
+            if available <= 0:
+                log.warning(
+                    "Blocked naked sell fill: %s %s shares on %s",
+                    side,
+                    shares,
+                    market_id[:16],
+                )
+                return 0.0
+            if shares > available:
+                log.warning(
+                    "Capped sell fill to owned inventory: requested %.4f %s, owned %.4f",
+                    shares,
+                    side,
+                    available,
+                )
+                shares = available
+
         if market_id not in self.positions:
             self.positions[market_id] = Position(market_id=market_id)
 
@@ -366,7 +405,7 @@ class RiskManager:
                 pnl = (price - pos.no_avg_cost) * shares
                 pos.no_shares = max(0, pos.no_shares - shares)
             pos.realized_pnl += pnl
-            pos.total_cost = max(0, pos.total_cost - revenue)
+            pos.total_cost = max(0, pos.total_cost - cost_released)
             self.balance += revenue
             realized_pnl = pnl
 
@@ -549,6 +588,25 @@ class PaperTrader:
                     if random.random() < config.FILL_PROBABILITY:
                         filled = True
 
+            if filled and order.order_type == "ASK" and not config.ALLOW_NAKED_ASKS:
+                sellable = self.risk.available_shares(order.market_id, order.side)
+                if sellable <= 0:
+                    log.debug(
+                        "  Skipping ASK fill without owned %s inventory on %s",
+                        order.side,
+                        order.market_id[:16],
+                    )
+                    remaining.append(order)
+                    continue
+                if order.size > sellable:
+                    log.warning(
+                        "  Capping ASK fill from %.4f to owned %.4f %s shares",
+                        order.size,
+                        sellable,
+                        order.side,
+                    )
+                    order.size = sellable
+
             if filled:
                 order.filled = True
                 order.fill_price = order.price
@@ -608,6 +666,54 @@ class PaperTrader:
         active = [o for o in self.open_orders if not o.filled and o.market_id == market_id]
         return len(active) >= 2  # at least one bid + one ask
 
+    def _reserved_ask_shares(self, market_id: str, side: str) -> float:
+        """Open sell orders already reserving inventory for this market side."""
+        return sum(
+            order.size
+            for order in self.open_orders
+            if (
+                not order.filled
+                and order.market_id == market_id
+                and order.side == side
+                and order.order_type == "ASK"
+            )
+        )
+
+    def _available_to_sell(self, market_id: str, side: str) -> float:
+        owned = self.risk.available_shares(market_id, side)
+        return max(0.0, owned - self._reserved_ask_shares(market_id, side))
+
+    def _quote_gate_reason(self, decision: RegimeDecision, poly_signal: dict, mid: float):
+        """Return a reason to skip quoting, or None when quoting is allowed."""
+        seconds_remaining = poly_signal.get("poly_seconds_remaining")
+        if (
+            seconds_remaining is not None
+            and seconds_remaining < config.QUOTE_MIN_SECONDS_REMAINING
+        ):
+            return (
+                f"market too close to expiry "
+                f"({seconds_remaining:.0f}s < {config.QUOTE_MIN_SECONDS_REMAINING}s)"
+            )
+
+        if mid < config.QUOTE_MIN_MID or mid > config.QUOTE_MAX_MID:
+            return (
+                f"mid outside safe band "
+                f"({mid:.3f} not in {config.QUOTE_MIN_MID:.2f}-{config.QUOTE_MAX_MID:.2f})"
+            )
+
+        if decision.mode == 1:
+            if not config.ENABLE_QUIET_MODE_QUOTES:
+                return "Mode 1 quiet quoting disabled until settled edge is proven"
+
+            btc_momentum = abs(poly_signal.get("btc_momentum") or 0.0)
+            short_momentum = abs(poly_signal.get("short_momentum") or 0.0)
+            if btc_momentum > config.QUIET_MAX_ABS_BTC_MOMENTUM:
+                return f"quiet gate rejected BTC momentum {btc_momentum:.4%}"
+            if short_momentum > config.QUIET_MAX_ABS_SHORT_MOMENTUM:
+                return f"quiet gate rejected short momentum {short_momentum:.4%}"
+
+        return None
+
     def generate_orders(self, decision: RegimeDecision, poly_signal: dict) -> List[PaperOrder]:
         """
         Generate paper orders based on current regime.
@@ -637,6 +743,11 @@ class PaperTrader:
         # Filter: skip obviously non-tradable books
         if live_spread is not None and live_spread > config.MIN_TRADABLE_SPREAD:
             log.debug(f"  Skipping untradable market: spread={live_spread:.3f}")
+            return []
+
+        gate_reason = self._quote_gate_reason(decision, poly_signal, mid)
+        if gate_reason:
+            log.debug(f"  Skipping quotes: {gate_reason}")
             return []
 
         # Don't duplicate quotes if we already have active ones in quiet mode
@@ -669,8 +780,18 @@ class PaperTrader:
             order_key = (order.market_id, order.side, order.order_type)
             if order_key in active_keys:
                 continue
+            if order.order_type == "ASK" and not config.ALLOW_NAKED_ASKS:
+                sellable = self._available_to_sell(order.market_id, order.side)
+                if sellable <= 0:
+                    log.debug(
+                        "  Skipping ASK quote without owned %s inventory on %s",
+                        order.side,
+                        order.market_id[:16],
+                    )
+                    continue
+                order.size = min(order.size, sellable)
             allowed, adj_size, reason = self.risk.check_order(
-                order.market_id, order.side, order.size, order.price
+                order.market_id, order.side, order.size, order.price, order.order_type
             )
             if allowed and adj_size > 0:
                 order.size = adj_size
