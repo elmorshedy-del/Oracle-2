@@ -454,10 +454,15 @@ class RiskManager:
 
     def get_stats(self) -> dict:
         total_exposure = self.total_exposure()
+        cash_total_pnl = self.balance - self.starting_capital
+        cash_daily_pnl = self.balance - self.daily_starting_balance
         return {
             "balance": round(self.balance, 2),
-            "total_pnl": round(self.balance - self.starting_capital, 2),
-            "daily_pnl": round(self.balance - self.daily_starting_balance, 2),
+            "cash_balance": round(self.balance, 2),
+            "total_pnl": round(cash_total_pnl, 2),
+            "daily_pnl": round(cash_daily_pnl, 2),
+            "cash_total_pnl": round(cash_total_pnl, 2),
+            "cash_daily_pnl": round(cash_daily_pnl, 2),
             "peak_balance": round(self.peak_balance, 2),
             "num_positions": len(self.positions),
             "halted": self.halted,

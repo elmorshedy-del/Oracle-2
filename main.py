@@ -539,7 +539,7 @@ class PolymarketBot:
                 "date": today,
                 "starting_balance": self.risk.daily_starting_balance,
                 "ending_balance": stats["balance"],
-                "total_pnl": stats["daily_pnl"],
+                "total_pnl": stats["cash_daily_pnl"],
                 "num_trades": self.trader.total_orders_placed,
                 "num_fills": self.trader.total_fills,
                 "mode1_pnl": 0,  # TODO: track per-mode PnL
